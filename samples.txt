@@ -1,0 +1,4 @@
+# E1 debugging inputs only; not a frozen E3 evaluation set.
+specs/12051b318b_spec.md
+specs/02828845dd_spec.md
+specs/9c14791748_spec.md

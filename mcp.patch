@@ -1,0 +1,455 @@
+diff --git a/package.json b/package.json
+index c09351d..61f2469 100644
+--- a/package.json
++++ b/package.json
+@@ -11,9 +11,9 @@
+     },
+     "dependencies": {
+         "@modelcontextprotocol/sdk": "^1.26.0",
+-        "vscode-jsonrpc": "^8.2.0",
++        "vscode-jsonrpc": "8.2.0",
+         "vscode-languageserver": "^9.0.1",
+-        "vscode-languageserver-protocol": "^3.17.5"
++        "vscode-languageserver-protocol": "3.17.5"
+     },
+     "devDependencies": {
+         "@types/node": "^20.11.0",
+diff --git a/src/codeql-lsp-client.ts b/src/codeql-lsp-client.ts
+index 695318e..6f0b430 100644
+--- a/src/codeql-lsp-client.ts
++++ b/src/codeql-lsp-client.ts
+@@ -44,6 +44,31 @@ export class CodeQLLanguageServer {
+     private codeqlPath?: string;
+ 
+     private diagnosticsListeners: Map<string, DiagnosticsHandler[]> = new Map();
++    private diagnosticsCache: Map<string, Diagnostic[]> = new Map();
++
++    private async request<T>(method: string, params?: any, timeoutMs = 120000): Promise<T> {
++        if (!this.connection) throw new Error("Language server not started");
++        let timer: ReturnType<typeof setTimeout> | undefined;
++        try {
++            return await Promise.race([
++                params === undefined
++                    ? this.connection.sendRequest<T>(method)
++                    : this.connection.sendRequest<T>(method, params),
++                new Promise<never>((_, reject) => {
++                    timer = setTimeout(() => reject(new Error(`${method} timed out after ${timeoutMs}ms`)), timeoutMs);
++                }),
++            ]);
++        } finally {
++            clearTimeout(timer);
++        }
++    }
++
++    private handleDiagnostics(params: PublishDiagnosticsParams): void {
++        this.diagnosticsCache.set(params.uri, params.diagnostics);
++        const listeners = this.diagnosticsListeners.get(params.uri) || [];
++        this.diagnosticsListeners.delete(params.uri);
++        for (const listener of listeners) listener(params);
++    }
+ 
+     constructor(options: CodeQLClientOptions = {}) {
+         this.verbose = options.verbose ?? false;
+@@ -136,34 +161,34 @@ export class CodeQLLanguageServer {
+ 
+         this.process = spawn(this.codeqlPath!, args, {
+             stdio: ["pipe", "pipe", "pipe"],
++            detached: process.platform !== "win32",
+         }) as ChildProcessWithoutNullStreams;
+ 
++        this.process.on("error", (error) => {
++            console.error(`CodeQL language server failed: ${error.message}`);
++            this.connection?.dispose();
++            this.connection = null;
++            this.process = null;
++        });
++
+         if (!this.process || !this.process.pid) {
+             this.log(`Failed to start CodeQL language server`);
+             throw new Error(`Failed to start CodeQL language server`);
+         }
+ 
+         this.log(`Process started with PID: ${this.process.pid}`);
++        console.error(`CodeQL LSP pid=${this.process.pid}`);
+ 
+-        // Auto-restart on unexpected exit
+         this.process.on("exit", (code, signal) => {
+             this.log(`CodeQL language server exited with code ${code}, signal ${signal}`);
+             this.process = null;
++            this.connection?.dispose();
+             this.connection = null;
+-
+-            // Auto-restart after 2 seconds if it wasn't a clean shutdown
+-            if (code !== 0) {
+-                this.log(`Restarting CodeQL language server in 2 seconds...`);
+-                setTimeout(() => {
+-                    this.start(this.workspaceFolders).catch(err =>
+-                        this.log(`Failed to restart CodeQL language server: ${err}`)
+-                    );
+-                }, 2000);
+-            }
++            this.diagnosticsCache.clear();
+         });
+ 
+         this.process.stderr?.on("data", (data) => {
+-            this.log(`CodeQL LSP stderr: ${data.toString().trim()}`);
++            process.stderr.write(data);
+         });
+ 
+         const reader = new StreamMessageReader(this.process.stdout!);
+@@ -180,15 +205,7 @@ export class CodeQLLanguageServer {
+                     this.log(`First diagnostic: ${JSON.stringify(params.diagnostics[0])}`);
+                 }
+ 
+-                // Notify listeners when we have diagnostics 
+-                const listeners = this.diagnosticsListeners.get(params.uri);
+-                if (listeners && listeners.length > 0 && params.diagnostics.length > 0) {
+-                    this.log(`Notifying ${listeners.length} listener(s) for ${params.uri}`);
+-                    for (const listener of listeners) {
+-                        listener(params);
+-                    }
+-                    this.diagnosticsListeners.delete(params.uri);
+-                }
++                this.handleDiagnostics(params);
+             }
+         );
+ 
+@@ -243,7 +260,7 @@ export class CodeQLLanguageServer {
+         this.log(`Sending initialize request with params:`);
+         this.log(`Init params: ${JSON.stringify(initParams, null, 2)}`);
+ 
+-        const initResult = await this.connection.sendRequest("initialize", initParams);
++        const initResult = await this.request("initialize", initParams);
+         this.log(`Initialize response received: ${JSON.stringify(initResult)}`);
+ 
+         this.log(`Sending initialized notification`);
+@@ -255,32 +272,51 @@ export class CodeQLLanguageServer {
+ 
+     async stop(): Promise<void> {
+         this.log(`stop() called`);
++        const child = this.process;
++        const connection = this.connection;
+ 
+-        if (this.connection) {
++        if (connection) {
+             this.log(`Sending shutdown request`);
+             try {
+-                await this.connection.sendRequest("shutdown");
++                await this.request("shutdown", undefined, 1000);
+                 this.log(`Shutdown request sent`);
+                 this.log(`Sending exit notification`);
+-                this.connection.sendNotification("exit");
++                await connection.sendNotification("exit");
+                 this.log(`Exit notification sent`);
+             } catch (e) {
+                 this.log(`Error during shutdown: ${e}`);
+             }
+             this.log(`Disposing connection`);
+-            this.connection.dispose();
++            connection.dispose();
+             this.connection = null;
+         }
+ 
+-        if (this.process) {
+-            this.log(`Killing process PID: ${this.process.pid}`);
+-            this.process.stdin?.end();
+-            this.process.kill();
+-            this.process.stdout?.destroy();
+-            this.process.stderr?.destroy();
+-            this.process = null;
+-            this.log(`Process killed`);
++        if (child?.pid) {
++            const signal = (name: NodeJS.Signals) => {
++                try {
++                    if (process.platform === "win32") child.kill(name);
++                    else process.kill(-child.pid!, name);
++                } catch (error) {
++                    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
++                }
++            };
++            if (child.exitCode === null && child.signalCode === null) {
++                await new Promise<void>((resolve) => {
++                    const timer = setTimeout(() => {
++                        signal("SIGKILL");
++                        resolve();
++                    }, 500);
++                    child.once("exit", () => { clearTimeout(timer); resolve(); });
++                    signal("SIGTERM");
++                });
++            }
++            child.stdin?.end();
++            child.stdout?.destroy();
++            child.stderr?.destroy();
+         }
++        this.process = null;
++        this.diagnosticsCache.clear();
++        this.documentVersions.clear();
+ 
+         this.log(`Stop complete`);
+     }
+@@ -295,6 +331,7 @@ export class CodeQLLanguageServer {
+         }
+ 
+         const version = 1;
++        this.diagnosticsCache.delete(uri);
+         this.documentVersions.set(uri, version);
+         this.log(`Set document version to ${version}`);
+ 
+@@ -313,7 +350,7 @@ export class CodeQLLanguageServer {
+ 
+         this.log(`Sending textDocument/codeQLDidChangeVisibleFiles`);
+         await this.connection.sendNotification("textDocument/codeQLDidChangeVisibleFiles", {
+-            visibleFiles: [uri]
++            visibleFiles: [...this.documentVersions.keys()]
+         });
+         this.log(`textDocument/codeQLDidChangeVisibleFiles sent`);
+ 
+@@ -345,6 +382,7 @@ export class CodeQLLanguageServer {
+     async updateDocument(uri: string, content: string): Promise<void> {
+         this.log(`updateDocument() called for ${uri}`);
+         this.log(`Content length: ${content.length} chars`);
++        this.diagnosticsCache.clear();
+ 
+         if (!this.connection) {
+             this.log(`No connection available`);
+@@ -401,7 +439,6 @@ export class CodeQLLanguageServer {
+         if (!this.connection) {
+             throw new Error("Language server not started");
+         }
+-
+         const params: CompletionParams = {
+             textDocument: { uri },
+             position: { line, character },
+@@ -410,7 +447,7 @@ export class CodeQLLanguageServer {
+                 : { triggerKind: 1 },
+         };
+ 
+-        const result = await this.connection.sendRequest<CompletionList>(
++        const result = await this.request<CompletionList>(
+             "textDocument/completion",
+             params
+         );
+@@ -436,7 +473,7 @@ export class CodeQLLanguageServer {
+         };
+ 
+         try {
+-            const result = await this.connection.sendRequest<Hover | null>(
++            const result = await this.request<Hover | null>(
+                 "textDocument/hover",
+                 params
+             );
+@@ -450,7 +487,7 @@ export class CodeQLLanguageServer {
+             return null;
+         } catch (error) {
+             this.log(`Hover request failed: ${error instanceof Error ? error.message : String(error)}`);
+-            return null;
++            throw error;
+         }
+     }
+ 
+@@ -468,7 +505,7 @@ export class CodeQLLanguageServer {
+             position: { line, character },
+         };
+ 
+-        const result = await this.connection.sendRequest<
++        const result = await this.request<
+             Location | Location[] | null
+         >("textDocument/definition", params);
+ 
+@@ -486,6 +523,7 @@ export class CodeQLLanguageServer {
+             this.log(`No connection available for diagnostics`);
+             throw new Error("Language server not started");
+         }
++        if (this.diagnosticsCache.has(uri)) return this.diagnosticsCache.get(uri)!;
+ 
+         this.log(`Waiting for publishDiagnostics notification...`);
+ 
+@@ -535,7 +573,7 @@ export class CodeQLLanguageServer {
+             },
+         };
+ 
+-        const edits = await this.connection.sendRequest<TextEdit[]>(
++        const edits = await this.request<TextEdit[]>(
+             "textDocument/formatting",
+             params
+         );
+@@ -558,7 +596,7 @@ export class CodeQLLanguageServer {
+             context: { includeDeclaration: true },
+         };
+ 
+-        const result = await this.connection.sendRequest<Location[] | null>(
++        const result = await this.request<Location[] | null>(
+             "textDocument/references",
+             params
+         );
+diff --git a/src/index.ts b/src/index.ts
+index e89a28c..d4e9b0d 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -24,17 +24,23 @@ const server = new Server(
+ );
+ 
+ let codeqlServer: CodeQLLanguageServer | null = null;
++let startup: Promise<CodeQLLanguageServer> | null = null;
+ 
+ // Initialize server when first needed
+ async function ensureCodeQLServer() {
+-    if (!codeqlServer) {
++    if (!startup) {
+         console.error(`[${instanceId}] Creating new CodeQL server instance...`);
+-        codeqlServer = new CodeQLLanguageServer({ verbose: false });
++        codeqlServer = new CodeQLLanguageServer({ verbose: false, codeqlPath: process.env.CODEQL_PATH });
+         console.error(`[${instanceId}] Starting CodeQL server with workspace: ${process.cwd()}`);
+-        await codeqlServer.start([process.cwd()]);
+-        console.error(`[${instanceId}] CodeQL language server started and ready`);
++        const instance = codeqlServer;
++        startup = instance.start([process.cwd()]).then(() => instance).catch(async (error) => {
++            await instance.stop();
++            throw error;
++        });
+     }
+-    return codeqlServer;
++    const instance = await startup;
++    if (!instance.isRunning()) throw new Error("CodeQL language server exited; start a new MCP session");
++    return instance;
+ }
+ 
+ server.setRequestHandler(ListToolsRequestSchema, async () => {
+@@ -253,6 +259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+ 
+     if (!args) {
+         return {
++            isError: true,
+             content: [
+                 {
+                     type: "text",
+@@ -266,6 +273,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+         codeqlServer = await ensureCodeQLServer();
+     } catch (error) {
+         return {
++            isError: true,
+             content: [
+                 {
+                     type: "text",
+@@ -447,6 +455,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+         }
+     } catch (error) {
+         return {
++            isError: true,
+             content: [
+                 {
+                     type: "text",
+@@ -458,25 +467,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+ });
+ 
+ // Cleanup on exit
++let closing = false;
+ const cleanup = async () => {
+-    if (codeqlServer) {
+-        console.error("Stopping CodeQL language server...");
+-        await codeqlServer.stop();
++    if (closing) return;
++    closing = true;
++    try {
++        if (codeqlServer) {
++            console.error("Stopping CodeQL language server...");
++            await codeqlServer.stop();
++        }
++    } finally {
++        process.exit(0);
+     }
+-    process.exit(0);
+ };
+ 
+ process.on("SIGINT", () => { console.error("[SIGINT received]"); cleanup(); });
+ process.on("SIGTERM", () => { console.error("[SIGTERM received]"); cleanup(); });
++process.stdin.on("end", () => { void cleanup(); });
++server.onclose = () => { void cleanup(); };
+ 
+ const transport = new StdioServerTransport();
+ server.connect(transport);
+ console.error("CodeQL MCP Server started");
++console.error(`CodeQL MCP pid=${process.pid}`);
+ console.error("To use this server, set CODEQL_PATH environment variable or ensure 'codeql' is in PATH");
+-
+-// Start CodeQL server eagerly to avoid cold start delay on first request
+-ensureCodeQLServer().then(() => {
+-    console.error("CodeQL language server ready");
+-}).catch((err) => {
+-    console.error(`Failed to pre-start CodeQL server: ${err}`);
+-});
+\ No newline at end of file
+diff --git a/tests/diagnostics.test.mjs b/tests/diagnostics.test.mjs
+new file mode 100644
+index 0000000..df067da
+--- /dev/null
++++ b/tests/diagnostics.test.mjs
+@@ -0,0 +1,68 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { CodeQLLanguageServer } from "../dist/codeql-lsp-client.js";
++
++const uri = "file:///candidate/query.ql";
++const error = {
++    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
++    severity: 1,
++    message: "Unknown type",
++};
++
++function client() {
++    const instance = new CodeQLLanguageServer({ codeqlPath: "codeql" });
++    instance.connection = {};
++    return instance;
++}
++
++test("an early empty notification is cached", async () => {
++    const instance = client();
++    instance.handleDiagnostics({ uri, diagnostics: [] });
++    assert.deepEqual(await instance.getDiagnostics(uri, 50), []);
++    assert.deepEqual(await instance.getDiagnostics(uri, 50), []);
++});
++
++test("an empty notification resolves all pending readers", async () => {
++    const instance = client();
++    const first = instance.getDiagnostics(uri, 50);
++    const second = instance.getDiagnostics(uri, 50);
++    instance.handleDiagnostics({ uri, diagnostics: [] });
++    assert.deepEqual(await first, []);
++    assert.deepEqual(await second, []);
++    assert.equal(instance.diagnosticsListeners.size, 0);
++});
++
++test("errors and URI isolation are preserved", async () => {
++    const instance = client();
++    instance.handleDiagnostics({ uri, diagnostics: [error] });
++    assert.deepEqual(await instance.getDiagnostics(uri, 50), [error]);
++    await assert.rejects(instance.getDiagnostics("file:///another/query.ql", 10), /Timeout/);
++    assert.equal(instance.diagnosticsListeners.size, 0);
++});
++
++test("no notification is a timeout, not an empty success", async () => {
++    const instance = client();
++    await assert.rejects(instance.getDiagnostics(uri, 10), /Timeout/);
++    assert.equal(instance.diagnosticsCache.has(uri), false);
++});
++
++test("a new session cannot reuse another candidate's diagnostics", async () => {
++    const first = client();
++    first.handleDiagnostics({ uri, diagnostics: [error] });
++    const second = client();
++    assert.equal(second.diagnosticsCache.has(uri), false);
++    second.handleDiagnostics({ uri, diagnostics: [] });
++    assert.deepEqual(await second.getDiagnostics(uri, 50), []);
++});
++
++test("LSP requests have a bounded timeout", async () => {
++    const instance = client();
++    instance.connection.sendRequest = () => new Promise(() => {});
++    await assert.rejects(instance.request("textDocument/hover", {}, 10), /timed out/);
++});
++
++test("hover transport errors are not hidden as missing hover", async () => {
++    const instance = client();
++    instance.connection.sendRequest = async () => { throw new Error("transport closed"); };
++    await assert.rejects(instance.getHover(uri, 0, 0), /transport closed/);
++});

@@ -1,0 +1,4 @@
+name: local/qlcoder-cpp-lite
+version: 0.0.1
+dependencies:
+  codeql/cpp-all: 7.0.0
