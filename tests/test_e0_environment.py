@@ -75,7 +75,7 @@ def setUpModule():
 class E0CliTests(unittest.TestCase):
     def test_sdk_and_codeql_version(self):
         with OpenAI(api_key="e0-local-construction-only", base_url="http://127.0.0.1:1", max_retries=0) as client:
-            self.assertTrue(callable(client.chat.completions.create))
+            self.assertTrue(callable(client.responses.create))
         result = cli("codeql-version", "version", "--format=json")
         self.assertEqual(result["returncode"], 0)
         self.assertEqual(json.loads(result["stdout"])["version"], "2.24.3")

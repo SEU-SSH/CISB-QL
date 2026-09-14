@@ -1,8 +1,10 @@
 # 从 Spec 生成有效 QL：轻量研究实验计划
 
-更新日期：2026-09-10。
+更新日期：2026-09-11。
 
-定位：单机、串行、固定模型的小型研究原型，不建设通用 Agent 平台。推荐在 `~/qlcoder-cpp-lite/` 独立实施；本文只规定后续建设方案，不表示工具或代码已部署。
+定位：单机、串行、固定模型的小型研究原型，不建设通用 Agent 平台。在 `~/qlcoder-cpp-lite/` 独立实施；本文保留实验设计，实际部署与验收以实施状态及回执为准。
+
+实施状态：E0 环境及用户运行的 Responses 探针已通过；E1 CLI 闭环、E2 MCP 接入已实现。`e2-debug-1` / `e2-debug-1-no-mcp` 真实单样本对照仅作 pilot。E3 的 smoke、旧候选独立复验与 A/B 汇总已实现，94 项本地测试全部通过，两份真实 E2 查询在双库复验通过且均为零行。冻结方案下的 A/B 各三次正式重复现已完成，共 18 个样本运行，三次修复内两组均通过 9/9；本批未请求 smoke，语义仍未评估。17 个冻结文件核对通过，完整结果见 `runs/E3-formal-report/` 与 `README.md`。
 
 ## 1. 核心目标与精简边界
 
@@ -38,6 +40,7 @@
 ```text
 ~/qlcoder-cpp-lite/
 ├── run.py                    # 单样本/批量入口，同一个主流程
+├── report.py                 # 显式配对 A/B 回执，输出 JSON/Markdown 汇总
 ├── harness.py                # 生成、工具调用、检查、修复、结果保存
 ├── agent_backend.py          # 唯一模型后端和 tool-call 往返
 ├── codeql_tools.py            # MCP 会话、CLI compile/run
@@ -47,6 +50,7 @@
 ├── prompt.md
 ├── specs/                    # 筛选后的只读 *_spec.md 快照
 ├── samples.txt               # 固定实验样本，每行一个 spec 相对路径
+├── e3-freeze.sha256          # 17 个控制文件的普通校验清单，不是配置 profile
 ├── codeql-pack/
 │   ├── qlpack.yml
 │   ├── codeql-pack.lock.yml
@@ -211,7 +215,13 @@ Prompt 提供完整 spec、固定版本和模板，只使用普通 AST/局部结
 
 ### 5.2 一个后端、少量工具
 
-`agent_backend.py` 只实现一个 OpenAI-compatible Chat Completions 后端，保留 tool-call/result 往返和 usage。工具阶段不强制与工具响应冲突的 JSON 文本模式，最终输出交给 Harness 解析；不切换 API 类型、Agent CLI 或模型。[R6]
+`agent_backend.py` 只实现一个 OpenAI SDK-compatible Responses 后端，使用 `client.responses.create`。2026-09-11 将原计划中的 Chat Completions 升级为 DeepSeek Responses；不保留自动回退或多后端选择，不改变模型、Prompt、配置值和修复预算。[R6]
+
+请求使用 `instructions`、`input` 和 `max_output_tokens`。DeepSeek Responses 为无状态接口，不使用 `previous_response_id`、`conversation` 或 `store`；每次请求由 Harness 提供所需上下文。E1 每轮继续传完整 spec、模板和上一轮候选/诊断。工具阶段使用扁平 function 定义，将完整 `response.output`（包括 reasoning）与对应 `call_id` 的 `function_call_output` 加入客户端历史，再发下一次请求；不能把函数调用项的 `id` 当作 `call_id`。
+
+最终 JSON 只从 completed 响应中 assistant message 的 `output_text` 汇总提取，不将 reasoning 或工具调用当成代码。`incomplete`（包括输出预算耗尽）按格式失败消耗本轮，不编译不完整候选；服务端 failed、非法协议和 API 错误按基础设施失败停止。工具阶段不强制 JSON 文本模式，最终输出交给 Harness 解析。
+
+保留原始 output 和 usage，新回执标记 `api_format: responses`，汇总使用 `input_tokens`、`output_tokens`、`total_tokens`，推理 token 已包含在 output 中，不重复相加。旧 Chat Completions 回执不改写；正式 A/B 组使用相同 API 格式。E0 本地工具无需重新部署，但切换后应重跑两请求上限的 Responses 模型探针，旧 Chat 探针通过不代表网关支持新接口。E2 的工具次数仍由客户端计数，不依赖服务端 `max_tool_calls`。
 
 Harness 管理 workspace、open 和 diagnostics。模型只访问 `codeql_hover`、`codeql_definition`，必要时使用最多 20 项的 `codeql_complete`。definition 可附锁定库中少量相邻源码；不开放任意文件、shell、安装或写文件工具。位置遵守 LSP 的 0-based/UTF-16 约定。
 
@@ -320,7 +330,9 @@ runs/<batch>/
     └── summary.json
 ```
 
-无效 JSON 时保留原始响应，不伪造候选文件。summary 记录成功轮次、编译/可选运行状态、失败原因、调用次数、耗时和 token；缺 usage 写 null，语义状态写 `not_evaluated`。smoke 输出放在该成功轮次下，按 C/C++ 区分。
+无效 JSON 时保留原始响应，不伪造候选文件。summary 记录成功轮次、编译/可选运行状态、失败原因、调用次数、耗时和 token；缺 usage 写 null，语义状态写 `not_evaluated`。随生成启用的 smoke 输出放在成功轮次的 `smoke/{c,cpp}/`；`generation_seconds` 不含 smoke，`smoke_seconds` 单列，`seconds` 为两阶段总耗时。批次预检另计。
+
+旧候选使用 `--smoke-from <batch>`，不要求模型凭据，不启动模型或 MCP。为保持旧回执不变，在临时 pack 中独立复编译并运行，临时文件随后清理；新目录只保存来源路径、四文件哈希、编译复验和 smoke 产物，不持久保存第二份候选，不写回旧 summary。两个固定数据库的模板预检、源码归档及元数据指纹一并记录；数据库本身的工具缓存/日志可以更新。
 
 不另外复制 work/compiled/accepted，不实现 promote、覆盖备份或回滚。每次实验使用新的 batch 目录，原结果不覆盖。成功候选目录能独立重跑编译，就是本阶段的交付产物。最基本的“不写旧项目、不泄露密钥、模型只能访问候选和固定库”仍需保留。
 
@@ -348,6 +360,7 @@ MCP 失败属于 B 组基础设施失败，不能悄悄作为 A 组结果使用�
 - `CompileInitial`：首次候选编译通过比例。
 - `CompileWithin3Repairs`：四个候选内通过比例，不使用含糊的 `Compile@3`。
 - 成功样本平均修复次数，以及全体编译失败/基础设施失败数量。
+- 格式失败与 QL 失败的候选次数分别统计，并分别记录后续修复是否启动；平均修复次数仍包含两者，不能把格式修复写成 QL 修复。
 - 总耗时、token、MCP 调用/失败次数，能取得时分列工具启动耗时。
 - 启用 smoke 时，补充已编译候选的运行成功比例；两个数据库均成功才算通过，零结果合法。
 
@@ -355,7 +368,7 @@ MCP 失败属于 B 组基础设施失败，不能悄悄作为 A 组结果使用�
 
 ### 7.3 一个入口
 
-以下是实现目标，不是已有脚本。`samples.txt` 每行一个相对项目根的 spec 路径，单文件和批量共用同一函数；批量串行运行，失败样本写日志后继续。
+单样本和串行批量入口已实现，支持 MCP on/off 和 `--smoke`。`samples.txt` 每行一个相对项目根的 spec 路径，单文件和批量共用同一函数；批量串行运行，失败样本写日志后继续。
 
 ```bash
 cd "$HOME/qlcoder-cpp-lite"
@@ -366,9 +379,70 @@ cd "$HOME/qlcoder-cpp-lite"
 .venv/bin/python run.py --samples samples.txt --mcp on --out runs/B-rep1
 # 可选：成功编译后执行固定的两个 smoke 数据库。
 .venv/bin/python run.py --samples samples.txt --mcp on --smoke --out runs/B-smoke
+# 无模型调用：复验已保存的成功候选，输出必须在原批次之外。
+.venv/bin/python run.py --smoke-from runs/e2-debug-1 --out runs/e3-smoke-B
+# 显式输入三次重复，A/B 列表顺序一一对应。
+.venv/bin/python report.py \
+  --a runs/A-rep1 runs/A-rep2 runs/A-rep3 \
+  --b runs/B-rep1 runs/B-rep2 runs/B-rep3 \
+  --purpose formal --overlap-note "All three specs also used for debugging; no held-out evaluation" \
+  --out runs/formal-report
 ```
 
 默认读取项目根 `config.json`，默认 MCP on。`--smoke` 固定使用第 6 节两个数据库，无任意数据库列表或配置 profile。全体样本达到请求关卡时退出 0，否则非零，具体原因以 summary 为准。不实现 resume/skip-existing、并发队列或服务模式。
+
+汇总输出 `report.json`（逐样本、逐重复、组汇总、配对结果和来源哈希）与 `report.md`。严格检查两组输入集合/哈希、prompt、配置、代码、API、工具链和共同策略一致；B 组重复还需 MCP 部署一致。拒绝模拟模型回执、重复目录、未完成批次或错分组，不自动扫描并筛选最优结果。预检后未运行的合法样本及基础设施失败仍在分母；缺 usage 保留未知及已知小计。已编译但 smoke 失败不撤销编译成功。
+
+`--purpose pilot/formal` 与调试重合说明必填。正式少于三次重复需用 `--note` 说明预算；声明为 formal 本身不证明统计稳定。当前三份 spec 仍可作为小规模固定集合，但必须披露全部与调试集重合；现有 E2 单样本对照只做 pilot，不能混入 E3 新代码的正式重复。模型、prompt、token 预算保持原值，完整 fish 命令见 README。
+
+### 7.4 已完成的正式编译实验
+
+实际顺序为 A1、B1、B2、A2、A3、B3，对应 `runs/E3-A-rep1..3` 与 `runs/E3-B-rep1..3`。每批三个固定 spec，全部原始批次与失败候选保留，无额外补跑、配置修改或结果替换。完整配对结果为 `runs/E3-formal-report/report.json`，可读表为同目录 `report.md`。
+
+| 指标 | A：MCP off | B：MCP on |
+|---|---:|---:|
+| 首次候选编译通过 | 2/9 | 3/9 |
+| 三次修复内编译通过 | 9/9 | 9/9 |
+| 成功样本平均修复次数 | 1.11 | 1.11 |
+| 格式失败候选次数 | 0 | 5 |
+| QL 失败候选次数 | 10 | 5 |
+| 基础设施失败 | 0 | 0 |
+| 模型请求次数 | 19 | 42 |
+| 样本生成总耗时（分钟，不含批次预检） | 23.89 | 50.82 |
+| 总 token | 579,823 | 1,799,355 |
+
+B 记录的 QL 失败轮次较少，但额外五次格式失败抵消了总修复次数上的优势。其中一次格式失败来自单次请求八个工具调用，超过固定的六次上限；不能把它计为 QL 编译错误。B3 的内联汇编 spec 首次候选通过，但已使用四次模型请求、五次工具调用，因此“首次候选”不等于“单次模型请求”。
+
+本次观察到 B 多一次首轮通过，最终通过率和平均修复次数相同；B 耗时为 A 的 2.13 倍、token 为 3.10 倍。这里只比较三个与调试集完全重合的 spec 的重复运行，不能据此推断 MCP 的普遍收益或语义检测准确性。本轮正式实验只测编译，先前 E2 候选的辅助 smoke 回执不混入该表。61 次模型响应均完成且 usage 完整，23 个 MCP 会话均记录关闭，实验后冻结清单全部匹配。
+
+### 7.5 五用例、单轮 A/B 扩展实验
+
+2026-09-12 按用户要求新增两个用例，各组只运行一个批次，共五个不同 spec、十个样本运行，无额外重复或失败补跑。`samples-5.txt` 保留原三例顺序，追加从 `/home/suiren/cisb-llm/specs/` 逐字节复制的 `7185ad2672`（清零操作被优化删除）和 `d50f2ab6f0`（移位未定义行为及无效检查）。保留原文及 provenance，不在观察生成结果后改写 spec，也不把新增两例声明为已认证的 held-out 集。
+
+旧 `samples.txt`、冻结清单、归档及六个历史批次均保留。新增冻结清单为 `e3-5spec-freeze-20260912.sha256`，源码归档为 `runs/e3-5spec-freeze-20260912.tar.gz`。模型、代码、prompt、token/超时/修复预算及 MCP 部署不变，使用当前导出的 API 配置；运行前最新的 E0 Responses 回执 `runs/e0/model-responses-20260912T124335.049170Z/model-probe.json` 已通过。本轮 API 配置更换后独立统计，不混入 7.4 的历史汇总。
+
+实际顺序为 `runs/E3-5spec-A-rep1-20260912`，再运行 `runs/E3-5spec-B-rep1-20260912`；退出码分别为 0 和 1。两组均处理五个合法输入，未启用 smoke。完整配对报告为 `runs/E3-5spec-report-20260912/report.md` 与 `report.json`；`--note` 同时披露单轮预算和运行中发现的分类问题。
+
+| 指标 | A：MCP off | B：MCP on |
+|---|---:|---:|
+| 首次候选编译通过 | 1/5 | 3/5 |
+| 实际运行中三次修复内编译通过 | 5/5 | 4/5 |
+| 仅成功样本的平均修复次数 | 1.80 | 0.25 |
+| 格式失败候选次数 | 1 | 0 |
+| 原始记录中的 QL 失败候选次数 | 8 | 2 |
+| 原始记录中的基础设施失败 | 0 | 1 |
+| 样本生成总耗时（分钟，不含批次预检） | 18.05 | 24.12 |
+| 模型请求次数 | 14 | 14 |
+| 模型主动工具调用次数 | 0 | 19 |
+| 总 token | 503,902 | 696,462 |
+
+**必须保留的限制：**B 的移位用例在 `attempt_1/query.qll:10-15` 中用 `getAQlClass()` / `getAPrimaryQlClass()` 定义 `ShiftOperation`，编译器报告非单调递归。九条错误中的两条定位到生成文件，七条定位到标准库；当前 `classify_compile` 只接受全部定位在生成双文件中的错误为 QL 失败，因此将该轮归为基础设施失败，处理两个候选后停止，剩余两次修复未使用。这不是 API 超时、MCP 故障或 pack 缺失，不能写成 B 已用尽四候选预算仍失败。
+
+原始分类、候选和回执未回写或重标，自动表保持 QL 失败 2 次、基础设施失败 1 次；诊断复核需额外说明其中 1 次是被误分类的查询递归错误。B 的平均修复次数只使用四个成功样本，不能忽略提前中止样本而宣称无条件优势。当前不修改冻结代码；后续应以混合标准库/本地定位的递归错误作为回归用例修复分类，再另行声明新实验，不补跑替换本轮结果。
+
+逐例成功候选索引（0 为首次）为：A `3, 3, 1, 2, 0`；B `0, 0, 1, 0, 未通过`。B 的内联汇编与清零用例没有主动调用模型工具，移位用例则在七次工具调用后仍因上述问题停止。因此不能把所有首轮差异归因于工具检索。B 的耗时为 A 的 1.34 倍、token 为 1.38 倍；五对单次观察仅支持描述性比较，不证明 MCP 的普遍收益、接口更换的因果效果或语义检测准确率。
+
+本轮二十八次模型响应均完成、usage 完整且加总一致，十二个 MCP 会话均记录关闭，MCP 故障数为零。实验前后新二十项和旧十七项冻结控制均匹配，历史六批元数据及原汇总哈希不变。离线检查通过八十三项，十一项真实工具集成未启用；两组实际批次另有真实 CLI 预检和 B 的 MCP/LSP 调用记录。
 
 ## 8. 四步实施与最小验收
 
@@ -387,11 +461,11 @@ cd "$HOME/qlcoder-cpp-lite"
 
 ## 9. 参考与验证边界
 
-沿用上一轮已核对的本地 CodeQL 2.24.3 和上游源码信息，本轮只精简方案，不重新部署或宣称测试已运行。具体 Python/npm 锁、模型工具调用、MCP 补丁和实验通过率仍需 E0～E3 实测。
+工具来源和固定版本沿用下列参考。E0 探针、E1/E2/E3 本地验证与真实 E2 pilot 的回执见 `README.md`；E3 正式实验通过率不能从模拟模型测试或单个调试样本推断。
 
 - [R1] QLCoder 固定参考：`https://github.com/neuralprogram/qlcoder/tree/b879ac2c90aac7fcc0b2e73caf117c2a12bf20e9`，只借鉴方法，不复现整个论文环境。
 - [R2] MCP 来源：`https://github.com/neuralprogram/codeql-lsp-mcp/tree/a33ea82bba156dc8352a0ecd85baff34cbb950ed`；README/package.json 为部署依据，`src/codeql-lsp-client.ts`、`src/index.ts` 为诊断缺口和工具接口依据。
 - [R3] CodeQL CLI：`https://docs.github.com/en/code-security/codeql-cli/codeql-cli-manual/query-compile`；compile、pack install/ci、language-server、database create、query run、bqrs decode 参数已在上一轮用本地固定版本帮助核对。
 - [R4] MCP Python SDK 接口参考：`https://github.com/modelcontextprotocol/python-sdk/tree/v1.26.0`。
 - [R5] 固定 bundle 发布：`https://github.com/github/codeql-action/releases/tag/codeql-bundle-v2.24.3`。
-- [R6] 模型工具协议参考：`https://developers.openai.com/api/reference/cli/resources/chat`；不据此推断第三方服务一定兼容。
+- [R6] DeepSeek Responses 协议：`https://api-docs.deepseek.com/zh-cn/guides/responses_api`；请求/输出字段：`https://api-docs.deepseek.com/zh-cn/api/create-response`。网关兼容性仍以 E0 新协议探针实测为准。

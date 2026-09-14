@@ -4,5 +4,5 @@
   "max_output_tokens": 384000,
   "max_repair_attempts": 3,
   "max_tool_calls_per_attempt": 6,
-  "timeout_seconds": 120
+  "timeout_seconds": 300
 }

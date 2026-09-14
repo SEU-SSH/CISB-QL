@@ -1,0 +1,8 @@
+# E3 five-spec experiment, September 12, 2026: one A/B pair, no repetitions.
+# The first three overlap earlier debugging/formal runs; this is not a held-out set.
+# The two additions are unchanged copies from /home/suiren/cisb-llm/specs/.
+specs/12051b318b_spec.md
+specs/02828845dd_spec.md
+specs/9c14791748_spec.md
+specs/7185ad2672_spec.md
+specs/d50f2ab6f0_spec.md

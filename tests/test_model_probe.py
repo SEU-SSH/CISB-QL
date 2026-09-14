@@ -16,11 +16,17 @@ CONFIG = {"model": "offline-test-model", "temperature": 0.2,
 TEMPLATE = {"qll_code": "import cpp\n", "ql_code": "import cpp\nimport query\n"}
 
 
-def completion(message, finish_reason):
-    return {"id": "offline", "object": "chat.completion", "created": 0,
-            "model": CONFIG["model"],
-            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+def response(output, status="completed"):
+    return {"id": "resp_offline", "object": "response", "created_at": 0,
+            "model": CONFIG["model"], "status": status, "output": output,
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20,
+                      "input_tokens_details": {"cached_tokens": 0},
+                      "output_tokens_details": {"reasoning_tokens": 5}}}
+
+
+def message(text):
+    return {"id": "msg_offline", "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}
 
 
 class ModelProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -29,30 +35,48 @@ class ModelProbeTests(unittest.IsolatedAsyncioTestCase):
         self.receipt = {}
 
         def handler(request):
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/v1/responses")
             body = json.loads(request.content)
             self.requests.append(body)
             if mode == "unauthorized":
                 return httpx.Response(401, json={"error": {"message": "bad test credentials"}})
             if len(self.requests) == 1:
                 if mode == "no_tool":
-                    return httpx.Response(200, json=completion({"role": "assistant", "content": "{}"}, "stop"))
+                    return httpx.Response(200, json=response([message("{}")]))
                 arguments = '{"unexpected": 1}' if mode == "bad_arguments" else "{}"
-                message = {"role": "assistant", "reasoning_content": "provider extension",
-                           "tool_calls": [{"id": "call_e0", "type": "function",
-                                           "function": {"name": "get_query_template", "arguments": arguments}}]}
-                return httpx.Response(200, json=completion(message, "tool_calls"))
-            tool_result = body["messages"][-1]
-            self.assertEqual(tool_result["tool_call_id"], "call_e0")
-            self.assertEqual(body["messages"][-2]["reasoning_content"], "provider extension")
-            content = tool_result["content"]
+                output = [{"id": "rs_e0", "type": "reasoning", "summary": [],
+                           "content": [{"type": "reasoning_text", "text": "provider reasoning"}]},
+                          {"id": "fc_e0", "type": "function_call", "call_id": "call_e0", "status": "completed",
+                           "name": "get_query_template", "arguments": arguments}]
+                if mode == "missing_call_id":
+                    del output[1]["call_id"]
+                elif mode == "multiple_tools":
+                    output.append({**output[1], "id": "fc_other", "call_id": "call_other"})
+                raw = response(output)
+                if mode == "truncated_tool":
+                    raw.update(status="incomplete", incomplete_details={"reason": "max_output_tokens"})
+                return httpx.Response(200, json=raw)
+            tool_result = body["input"][-1]
+            self.assertEqual(tool_result["type"], "function_call_output")
+            self.assertEqual(tool_result["call_id"], "call_e0")
+            self.assertEqual(body["input"][1:-1], self.receipt["requests"][0]["response"]["output"])
+            self.assertEqual(body["input"][1]["content"][0]["text"], "provider reasoning")
+            self.assertEqual(body["input"][-2]["id"], "fc_e0")
+            self.assertEqual(body["instructions"], self.requests[0]["instructions"])
+            content = tool_result["output"]
             if mode == "fence":
                 content = f"```json\n{content}\n```"
             elif mode == "ignored_result":
                 content = json.dumps(TEMPLATE)
             elif mode == "wrong_shape":
                 content = '{"qll_code": "import cpp"}'
-            reason = "length" if mode == "truncated" else "stop"
-            return httpx.Response(200, json=completion({"role": "assistant", "content": content}, reason))
+            raw = response([message(content)])
+            if mode == "truncated":
+                raw.update(status="incomplete", incomplete_details={"reason": "max_output_tokens"})
+            elif mode == "refusal":
+                raw["output"][0]["content"] = [{"type": "refusal", "refusal": "refused"}]
+            return httpx.Response(200, json=raw)
 
         async with AsyncOpenAI(api_key="offline-key", base_url="https://offline.invalid/v1",
                                max_retries=0, http_client=httpx.AsyncClient(
@@ -63,18 +87,25 @@ class ModelProbeTests(unittest.IsolatedAsyncioTestCase):
         await self.inspect_probe()
         self.assertEqual(len(self.requests), 2)
         self.assertTrue(all(self.receipt["checks"].values()))
-        self.assertEqual(self.requests[0]["max_tokens"], 1024)
-        self.assertEqual(len(self.receipt["requests"][0]["request"]["messages"]), 2)
+        self.assertEqual(self.requests[0]["max_output_tokens"], 1024)
+        self.assertEqual(len(self.receipt["requests"][0]["request"]["input"]), 1)
+        self.assertEqual(len(self.requests[1]["input"]), 4)
         self.assertEqual(self.requests[1]["tool_choice"], "none")
+        self.assertEqual(self.receipt["api_format"], "responses")
+        self.assertEqual(self.requests[0]["tools"][0]["name"], "get_query_template")
+        self.assertNotIn("function", self.requests[0]["tools"][0])
+        for body in self.requests:
+            self.assertEqual(set(body), {"model", "temperature", "max_output_tokens", "instructions",
+                                         "input", "tools", "tool_choice"})
 
     async def test_plain_text_and_bad_arguments_stop_after_first_request(self):
-        for mode in ("no_tool", "bad_arguments"):
+        for mode in ("no_tool", "bad_arguments", "missing_call_id", "multiple_tools", "truncated_tool"):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 await self.inspect_probe(mode)
             self.assertEqual(len(self.requests), 1)
 
     async def test_invalid_final_outputs_are_not_success(self):
-        for mode in ("fence", "ignored_result", "wrong_shape", "truncated"):
+        for mode in ("fence", "ignored_result", "wrong_shape", "truncated", "refusal"):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 await self.inspect_probe(mode)
             self.assertFalse(self.receipt["checks"]["tool_result_roundtrip"])

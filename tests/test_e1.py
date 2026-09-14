@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import httpx
 
-from agent_backend import BackendError, ChatBackend
+from agent_backend import BackendError, ResponsesBackend
 from codeql_tools import CodeQL, classify_compile, load_pack
 from harness import load_config, parse_candidate, run_sample, token_totals
 import run
@@ -28,14 +28,19 @@ GOOD = {"qll_code": PACK["query.qll"].decode(), "ql_code": PACK["query.ql"].deco
 SPEC = (ROOT / "specs/12051b318b_spec.md").read_bytes().decode()
 
 
-def generated(content=None, finish="stop"):
-    return {"finish_reason": finish, "message": {"role": "assistant", "content": content or json.dumps(GOOD)}}
+def generated(content=None, status="completed"):
+    text = json.dumps(GOOD) if content is None else content
+    return {"id": "resp_offline", "object": "response", "created_at": 0, "model": CONFIG["model"],
+            "status": status,
+            "output": [{"id": "msg_offline", "type": "message", "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}]}]}
 
 
 def sdk_response(content=None):
-    return {"id": "offline", "object": "chat.completion", "created": 0, "model": CONFIG["model"],
-            "choices": [{"index": 0, **generated(content)}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}
+    return {**generated(content),
+            "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                      "input_tokens_details": {"cached_tokens": 5},
+                      "output_tokens_details": {"reasoning_tokens": 12}}}
 
 
 def compile_result(status="passed", query=None):
@@ -50,7 +55,8 @@ def compile_result(status="passed", query=None):
 class FakeBackend:
     def __init__(self, outputs):
         self.outputs = iter(outputs)
-        self.messages = []
+        self.inputs = []
+        self.requests = []
 
     async def __aenter__(self):
         return self
@@ -58,16 +64,17 @@ class FakeBackend:
     async def __aexit__(self, *args):
         pass
 
-    async def generate(self, messages, trace):
-        self.messages.append(deepcopy(messages))
+    async def generate(self, instructions, input_items, trace, **options):
+        self.inputs.append(deepcopy(input_items))
         value = next(self.outputs)
-        event = {"request": {"messages": deepcopy(messages)}, "seconds": 0.01}
+        request = {"instructions": instructions, "input": deepcopy(input_items), **options}
+        self.requests.append(request)
+        event = {"request": request, "seconds": 0.01}
         trace.append(event)
         if isinstance(value, Exception):
             event["error"] = str(value)
             raise value
-        event["response"] = {"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
-                             "choices": [value]}
+        event["response"] = {**value, "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}
         return value
 
 
@@ -114,8 +121,28 @@ class ParsingTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 parse_candidate(generated(text))
         with self.assertRaises(ValueError):
-            parse_candidate(generated(finish="length"))
+            parse_candidate(generated(status="incomplete"))
         self.assertEqual(parse_candidate(generated()), GOOD)
+
+    def test_reasoning_is_not_candidate_text_and_text_parts_are_joined(self):
+        response = generated()
+        text = json.dumps(GOOD)
+        response["output"][0]["content"] = [
+            {"type": "output_text", "text": text[:20]}, {"type": "output_text", "text": text[20:]}]
+        response["output"].insert(0, {"type": "reasoning", "id": "rs_offline", "summary": [],
+                                      "content": [{"type": "reasoning_text", "text": "not candidate JSON"}]})
+        self.assertEqual(parse_candidate(response), GOOD)
+
+    def test_refusal_tools_empty_text_and_incomplete_message_are_rejected(self):
+        refused = generated()
+        refused["output"][0]["content"] = [{"type": "refusal", "refusal": "refused"}]
+        tool = generated()
+        tool["output"].append({"type": "function_call", "call_id": "call_1", "name": "unexpected", "arguments": "{}"})
+        partial = generated()
+        partial["output"][0]["status"] = "incomplete"
+        for response in (refused, tool, partial, generated(""), {**generated(), "output": []}):
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                parse_candidate(response)
 
     def test_duplicate_sample_id_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -138,6 +165,11 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(token_totals([{"error": "lost response"}]))
         self.assertEqual(token_totals([])["total_tokens"], 0)
 
+    def test_responses_usage_uses_native_fields_without_double_counting_reasoning(self):
+        self.assertEqual(token_totals([{"response": sdk_response()}] * 2),
+                         {"input_tokens": 20, "output_tokens": 40, "total_tokens": 60})
+        self.assertIsNone(token_totals([{"response": sdk_response()}, {"error": "lost response"}]))
+
 
 class HarnessTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, outputs, statuses):
@@ -155,6 +187,10 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["compile_initial"])
         self.assertEqual(summary["semantic_status"], "not_evaluated")
         self.assertEqual(summary["tokens"]["total_tokens"], 3)
+        self.assertEqual(summary["api_format"], "responses")
+        model = json.loads((self.directory / "attempt_0/model.json").read_text())
+        self.assertEqual(model["api_format"], "responses")
+        self.assertEqual(model["calls"][0]["request"]["instructions"], "fixed prompt")
         self.assertEqual((self.directory / "spec.md").read_bytes(), SPEC.encode())
         self.assertEqual((self.directory / "attempt_0/query.qll").read_text(), GOOD["qll_code"])
         self.assertFalse((self.directory / "attempt_1").exists())
@@ -165,7 +201,7 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["compile_calls"], 2)
         self.assertEqual(summary["model_calls"], 3)
         self.assertFalse((self.directory / "attempt_0/query.ql").exists())
-        feedback = json.loads(self.backend.messages[2][1]["content"])
+        feedback = json.loads(self.backend.inputs[2][0]["content"])
         self.assertEqual(feedback["repairs_remaining"], 1)
         self.assertIn("MissingType", feedback["previous_attempt"]["diagnostics"]["cli"]["stdout"])
         self.assertEqual(feedback["spec_markdown"], SPEC)
@@ -177,6 +213,14 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["model_calls"], 4)
         self.assertEqual(summary["compile_calls"], 0)
         self.assertFalse((self.directory / "attempt_4").exists())
+
+    async def test_truncated_response_uses_repair_budget_without_compilation(self):
+        truncated = {**generated(status="incomplete"), "incomplete_details": {"reason": "max_output_tokens"}}
+        summary = await self.exercise([truncated] * 5, [])
+        self.assertEqual(summary["status"], "generation_compile_failure")
+        self.assertEqual(summary["model_calls"], 4)
+        self.assertEqual(summary["compile_calls"], 0)
+        self.assertIn("max_output_tokens", summary["reason"])
 
     async def test_four_query_failures_are_capped(self):
         summary = await self.exercise([generated()] * 5, ["query_error"] * 5)
@@ -222,6 +266,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.trace = []
 
         async def handler(request):
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/v1/responses")
             self.requests.append(json.loads(request.content))
             if mode == "auth":
                 return httpx.Response(401, json={"error": {"message": "unauthorized"}})
@@ -229,21 +275,50 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 raise httpx.ConnectError("offline test", request=request)
             if mode == "timeout":
                 await asyncio.sleep(1)
-            return httpx.Response(200, json=sdk_response())
+            response = sdk_response()
+            if mode in ("failed", "cancelled", "in_progress", "queued"):
+                response["status"] = mode
+            elif mode == "incomplete":
+                response.update(status="incomplete", incomplete_details={"reason": "max_output_tokens"})
+            elif mode == "missing_output":
+                del response["output"]
+            elif mode == "error":
+                response["error"] = {"code": "server_error", "message": "provider failure"}
+            return httpx.Response(200, json=response)
 
-        async with ChatBackend({**CONFIG, "timeout_seconds": 0.05}, "offline-key", "https://offline.invalid/v1",
+        async with ResponsesBackend({**CONFIG, "timeout_seconds": 0.05}, "offline-key", "https://offline.invalid/v1",
                                httpx.AsyncClient(transport=httpx.MockTransport(handler))) as backend:
-            return await backend.generate([{"role": "user", "content": "offline"}], self.trace)
+            return await backend.generate("fixed prompt", [{"role": "user", "content": "offline"}], self.trace)
 
     async def test_one_connection_retry_with_full_trace(self):
         result = await self.exercise("connect")
-        self.assertEqual(result["finish_reason"], "stop")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(parse_candidate(result), GOOD)
         self.assertEqual(len(self.requests), 2)
         self.assertIn("error", self.trace[0])
         self.assertIn("response", self.trace[1])
         self.assertNotIn("tools", self.requests[0])
         self.assertEqual(self.requests[0]["temperature"], CONFIG["temperature"])
-        self.assertEqual(self.requests[0]["max_tokens"], 8000)
+        self.assertEqual(self.requests[0]["max_output_tokens"], 8000)
+        self.assertEqual(self.requests[0]["instructions"], "fixed prompt")
+        self.assertEqual(self.requests[0]["input"], [{"role": "user", "content": "offline"}])
+        self.assertEqual(set(self.requests[0]), {"model", "instructions", "input", "temperature", "max_output_tokens"})
+        self.assertEqual(result["usage"]["output_tokens_details"]["reasoning_tokens"], 12)
+
+    async def test_failed_or_invalid_response_is_infrastructure_error_without_retry(self):
+        for mode in ("failed", "cancelled", "in_progress", "queued", "missing_output", "error"):
+            with self.subTest(mode=mode), self.assertRaises(BackendError):
+                await self.exercise(mode)
+            self.assertEqual(len(self.requests), 1)
+            self.assertIn("response", self.trace[0])
+            self.assertIn("error", self.trace[0])
+
+    async def test_incomplete_response_reaches_format_validator_with_usage(self):
+        response = await self.exercise("incomplete")
+        with self.assertRaisesRegex(ValueError, "max_output_tokens"):
+            parse_candidate(response)
+        self.assertEqual(token_totals(self.trace)["total_tokens"], 30)
+        self.assertEqual(len(self.requests), 1)
 
     async def test_connection_retry_is_bounded(self):
         with self.assertRaises(BackendError):
@@ -341,14 +416,14 @@ class BatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x["status"] for x in experiment["summary"]],
                          ["infrastructure_failure", "input_error", "compiled"])
         self.assertEqual(compiler.preflights, 1)
-        self.assertEqual(len(backend.messages), 2)
+        self.assertEqual(len(backend.inputs), 2)
         self.assertEqual(experiment["mcp"], "off")
+        self.assertEqual(experiment["api_format"], "responses")
+        self.assertEqual(experiment["model_policy"]["token_parameter"], "max_output_tokens")
 
-    async def test_on_smoke_existing_output_and_outside_path_fail_before_model(self):
+    async def test_existing_output_and_outside_path_fail_before_model(self):
         (self.root / "runs/existing").mkdir(parents=True)
-        for flags in (["--mcp", "on", "--out", "runs/new"],
-                      ["--mcp", "off", "--smoke", "--out", "runs/new"],
-                      ["--mcp", "off", "--out", "runs/existing"],
+        for flags in (["--mcp", "off", "--out", "runs/existing"],
                       ["--mcp", "off", "--out", "/tmp/outside-e1"]):
             factory = unittest.mock.Mock()
             args = run.arguments(["--spec", "specs/a_spec.md", *flags])

@@ -15,17 +15,17 @@ from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI
 
+from agent_backend import API_FORMAT, response_text, validate_response
+
 
 ROOT = Path(__file__).resolve().parent
 TOOL = {
     "type": "function",
-    "function": {
-        "name": "get_query_template",
-        "description": "Read the two QL template files for this protocol probe.",
-        "parameters": {
-            "type": "object", "properties": {}, "required": [],
-            "additionalProperties": False,
-        },
+    "name": "get_query_template",
+    "description": "Read the two QL template files for this protocol probe.",
+    "parameters": {
+        "type": "object", "properties": {}, "required": [],
+        "additionalProperties": False,
     },
 }
 
@@ -63,16 +63,15 @@ def redact(value, sensitive):
 
 
 async def run_probe(client, config, template, receipt):
-    messages = [
-        {"role": "system", "content": (
-            "This is a short protocol test, not a coding task. First call "
-            "get_query_template exactly once with empty JSON arguments {}. "
-            "After receiving its result, return only that JSON object, with exactly "
-            "qll_code and ql_code. Copy both strings verbatim, including comments, "
-            "whitespace and the final newline. No Markdown fences or explanation."
-        )},
-        {"role": "user", "content": "Read the template using the tool, then return its JSON."},
-    ]
+    instructions = (
+        "This is a short protocol test, not a coding task. First call "
+        "get_query_template exactly once with empty JSON arguments {}. "
+        "After receiving its result, return only that JSON object, with exactly "
+        "qll_code and ql_code. Copy both strings verbatim, including comments, "
+        "whitespace and the final newline. No Markdown fences or explanation."
+    )
+    input_items = [{"role": "user", "content": "Read the template using the tool, then return its JSON."}]
+    receipt["api_format"] = API_FORMAT
     receipt["checks"] = {"native_tool_call": False, "dual_file_json": False,
                          "tool_result_roundtrip": False}
     receipt["requests"] = []
@@ -80,33 +79,32 @@ async def run_probe(client, config, template, receipt):
     async def ask(tool_choice):
         request = {
             "model": config["model"], "temperature": config["temperature"],
-            "max_tokens": min(config["max_output_tokens"], 1024),
-            "messages": messages, "tools": [TOOL], "tool_choice": tool_choice,
+            "max_output_tokens": min(config["max_output_tokens"], 1024),
+            "instructions": instructions, "input": input_items, "tools": [TOOL], "tool_choice": tool_choice,
         }
         entry = {"request": deepcopy(request)}
         receipt["requests"].append(entry)
         started = time.monotonic()
         try:
             response = await asyncio.wait_for(
-                client.chat.completions.create(**request), config["timeout_seconds"])
+                client.responses.create(**request), config["timeout_seconds"])
             entry["response"] = response.model_dump(mode="json", exclude_none=True)
         finally:
             entry["seconds"] = time.monotonic() - started
-        if len(response.choices) != 1:
-            raise ValueError("expected exactly one response choice")
-        choice = response.choices[0]
-        if choice.finish_reason not in ("stop", "tool_calls") or choice.message.refusal:
-            raise ValueError("response was truncated, refused, or not completed normally")
-        return choice.message
+        raw = entry["response"]
+        validate_response(raw)
+        if raw["status"] != "completed":
+            raise ValueError(f"incomplete response: {raw.get('incomplete_details')}")
+        return raw
 
     first = await ask("auto")
-    calls = first.tool_calls or []
+    calls = [item for item in first["output"] if item["type"] == "function_call"]
     if len(calls) != 1:
         raise ValueError("expected one native tool call; plain-text tool descriptions do not count")
     call = calls[0]
-    if call.type != "function" or call.function.name != "get_query_template" or not call.id:
-        raise ValueError("unexpected tool call or missing tool_call_id")
-    if json.loads(call.function.arguments) != {}:
+    if call.get("name") != "get_query_template" or not call.get("call_id"):
+        raise ValueError("unexpected tool call or missing call_id")
+    if json.loads(call["arguments"]) != {}:
         raise ValueError("get_query_template requires empty JSON arguments")
     receipt["checks"]["native_tool_call"] = True
 
@@ -114,16 +112,12 @@ async def run_probe(client, config, template, receipt):
     expected = dict(template)
     expected["qll_code"] = f"// e0-probe-{secrets.token_hex(8)}\n" + template["qll_code"]
     receipt["tool_result"] = expected
-    assistant = first.model_dump(mode="json", exclude_none=True,
-                                 include={"role", "content", "tool_calls", "reasoning_content"})
-    messages.extend([assistant, {"role": "tool", "tool_call_id": call.id,
-                                "content": json.dumps(expected)}])
+    # DeepSeek is stateless: replay all output items, including reasoning, before the tool result.
+    input_items.extend(deepcopy(first["output"]))
+    input_items.append({"type": "function_call_output", "call_id": call["call_id"],
+                        "output": json.dumps(expected)})
     final = await ask("none")
-    if final.tool_calls:
-        raise ValueError("expected final JSON, not another tool call")
-    if not isinstance(final.content, str):
-        raise ValueError("final response contains no text")
-    result = json.loads(final.content)
+    result = json.loads(response_text(final))
     if (not isinstance(result, dict) or set(result) != {"qll_code", "ql_code"}
             or not all(isinstance(value, str) and value.strip() for value in result.values())):
         raise ValueError("final JSON must have exactly two nonempty strings: qll_code and ql_code")
@@ -167,12 +161,12 @@ def main(argv=None):
         return 2
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    output = ROOT / "runs/e0" / f"model-{timestamp}"
+    output = ROOT / "runs/e0" / f"model-responses-{timestamp}"
     output.mkdir(parents=True, exist_ok=False)
-    receipt = {"status": "running", "config": config, "max_requests": 2,
+    receipt = {"status": "running", "api_format": API_FORMAT, "config": config, "max_requests": 2,
                "sdk_max_retries": 0, "json_output_mode": "prompt_only"}
     started = time.monotonic()
-    print("Running E0 model probe: at most 2 requests, <=1024 output tokens each, no retries.",
+    print("Running E0 Responses probe: at most 2 requests, <=1024 output tokens each, no retries.",
           flush=True)
     try:
         asyncio.run(execute(config, api_key, base_url, template, receipt))
