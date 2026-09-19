@@ -283,10 +283,18 @@ index 695318e..6f0b430 100644
              params
          );
 diff --git a/src/index.ts b/src/index.ts
-index e89a28c..d4e9b0d 100644
+index e89a28c..333a9d8 100644
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -24,17 +24,23 @@ const server = new Server(
+@@ -5,6 +5,7 @@ import {
+     ListToolsRequestSchema,
+ } from "@modelcontextprotocol/sdk/types.js";
+ import { CodeQLLanguageServer } from "./codeql-lsp-client.js";
++import { completePage, queryArguments, searchApi } from "./api-tools.js";
+ import { execSync } from "child_process";
+ import { randomInt } from "crypto";
+ import { hostname } from "os";
+@@ -24,22 +25,41 @@ const server = new Server(
  );
  
  let codeqlServer: CodeQLLanguageServer | null = null;
@@ -315,7 +323,45 @@ index e89a28c..d4e9b0d 100644
  }
  
  server.setRequestHandler(ListToolsRequestSchema, async () => {
-@@ -253,6 +259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     return {
+         tools: [
++            {
++                name: "codeql_search_api",
++                description: "Find literal API identifiers in pinned cpp-all 7.0.0 source; ten source hits per page, no source position required",
++                inputSchema: {
++                    type: "object",
++                    properties: {
++                        query: { type: "string", minLength: 1, maxLength: 128 },
++                        offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 },
++                    },
++                    required: ["query"],
++                    additionalProperties: false,
++                },
++            },
+             {
+                 name: "codeql_complete",
+                 description: "Get code completions at a specific position in a CodeQL file",
+@@ -63,11 +83,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
+                             description: "Optional trigger character",
+                         },
+                         limit: {
+-                            type: "number",
+-                            description: "Maximum number of completion items to return (default: 50)",
++                            type: "integer",
++                            enum: [20],
++                            description: "Fixed at 20 items per page",
+                         },
++                        query: { type: "string", maxLength: 128, default: "",
++                            description: "Literal name filter, applied before pagination" },
+                         offset: {
+-                            type: "number",
++                            type: "integer",
++                            minimum: 0,
++                            maximum: Number.MAX_SAFE_INTEGER,
+                             description: "Starting position for pagination (default: 0)",
+                         },
+                     },
+@@ -253,6 +278,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  
      if (!args) {
          return {
@@ -323,7 +369,24 @@ index e89a28c..d4e9b0d 100644
              content: [
                  {
                      type: "text",
-@@ -266,6 +273,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+@@ -262,10 +288,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+         };
+     }
+ 
++    // Source lookup does not require a running LSP or any candidate edits.
++    if (name === "codeql_search_api") {
++        try {
++            if (Object.keys(args).some(key => key !== "query" && key !== "offset")) {
++                throw new Error("Only query and offset are accepted by codeql_search_api");
++            }
++            const result = await searchApi(process.env.CODEQL_CPP_ALL_ROOT, args.query, args.offset);
++            return { content: [{ type: "text", text: JSON.stringify(result) }] };
++        } catch (error) {
++            return { isError: true, content: [{ type: "text", text: String(error) }] };
++        }
++    }
++
+     try {
          codeqlServer = await ensureCodeQLServer();
      } catch (error) {
          return {
@@ -331,7 +394,48 @@ index e89a28c..d4e9b0d 100644
              content: [
                  {
                      type: "text",
-@@ -447,6 +455,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+@@ -278,6 +318,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     try {
+         switch (name) {
+             case "codeql_complete": {
++                queryArguments(args.query ?? "", args.offset ?? 0, true);
++                if (args.limit !== undefined && args.limit !== 20) throw new Error("completion limit is fixed at 20");
+                 const completions = await codeqlServer!.getCompletions(
+                     args.file_uri as string,
+                     args.line as number,
+@@ -285,30 +327,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+                     args.trigger_character as string | undefined
+                 );
+ 
+-                const offset = args.offset as number || 0;
+-                const limit = args.limit as number || 50;
+-                const totalItems = completions.items?.length || 0;
+-                const items = completions.items?.slice(offset, offset + limit) || [];
+-
+-                const paginatedCompletions = {
+-                    ...completions,
+-                    items,
+-                    pagination: {
+-                        offset,
+-                        limit,
+-                        total: totalItems,
+-                        hasMore: offset + limit < totalItems
+-                    }
+-                };
+-
+-                let responseText = JSON.stringify(paginatedCompletions);
+-                if (totalItems > limit) {
+-                    const nextOffset = offset + limit;
+-                    const remaining = totalItems - nextOffset;
+-                    if (remaining > 0) {
+-                        responseText += `\n\n[PAGINATION INFO: Showing ${items.length} of ${totalItems} items. To get next ${Math.min(remaining, limit)} items, use: offset=${nextOffset}, limit=${limit}]`;
+-                    }
+-                }
++                const responseText = JSON.stringify(completePage(completions, args.query ?? "", args.offset ?? 0));
+ 
+                 return {
+                     content: [
+@@ -447,6 +466,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
          }
      } catch (error) {
          return {
@@ -339,7 +443,7 @@ index e89a28c..d4e9b0d 100644
              content: [
                  {
                      type: "text",
-@@ -458,25 +467,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+@@ -458,25 +478,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  });
  
  // Cleanup on exit
@@ -379,6 +483,229 @@ index e89a28c..d4e9b0d 100644
 -    console.error(`Failed to pre-start CodeQL server: ${err}`);
 -});
 \ No newline at end of file
+diff --git a/src/api-tools.ts b/src/api-tools.ts
+new file mode 100644
+index 0000000..9889646
+--- /dev/null
++++ b/src/api-tools.ts
+@@ -0,0 +1,100 @@
++import { readdir, readFile, realpath } from "node:fs/promises";
++import { isAbsolute, join, relative } from "node:path";
++import type { CompletionList } from "vscode-languageserver-protocol";
++
++export const CPP_ALL_VERSION = "7.0.0";
++
++export function queryArguments(query: unknown, offset: unknown = 0, allowEmpty = false) {
++    if (typeof query !== "string" || [...query].length > 128 || query.includes("\0") ||
++        (!allowEmpty && !query.trim())) {
++        throw new Error("query must be a literal string of at most 128 characters; search cannot be empty");
++    }
++    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
++        throw new Error("offset must be a nonnegative safe integer");
++    }
++    return { query, offset };
++}
++
++function rank(name: string, query: string) {
++    if (name === query) return 0;
++    if (name.toLowerCase() === query.toLowerCase()) return 1;
++    return name.toLowerCase().includes(query.toLowerCase()) ? 2 : 3;
++}
++
++function compare(a: string, b: string) { return a < b ? -1 : a > b ? 1 : 0; }
++
++export function completePage(completions: CompletionList, query: unknown = "", offset: unknown = 0) {
++    const input = queryArguments(query, offset, true);
++    const items = completions.items.map((item, index) => ({ item, index, rank: rank(item.label, input.query) }))
++        .filter(item => item.rank < 3)
++        .sort((a, b) => a.rank - b.rank || compare(a.item.label, b.item.label) ||
++            compare(a.item.detail ?? "", b.item.detail ?? "") || a.index - b.index);
++    return {
++        ...completions,
++        query: input.query,
++        unfiltered_total: completions.items.length,
++        items: items.slice(input.offset, input.offset + 20).map(item => item.item),
++        pagination: { offset: input.offset, limit: 20, total: items.length, hasMore: input.offset + 20 < items.length },
++    };
++}
++
++function contained(root: string, path: string) {
++    const name = relative(root, path);
++    return name !== ".." && !name.startsWith("../") && !isAbsolute(name);
++}
++
++async function qllFiles(root: string, directory = root): Promise<string[]> {
++    const files: string[] = [];
++    for (const entry of await readdir(directory, { withFileTypes: true })) {
++        // Never follow pack symlinks, even when their target happens to be inside the pack.
++        if (entry.isSymbolicLink()) continue;
++        const path = await realpath(join(directory, entry.name));
++        if (!contained(root, path)) continue;
++        if (entry.isDirectory()) files.push(...await qllFiles(root, path));
++        else if (entry.isFile() && path.endsWith(".qll")) files.push(path);
++    }
++    return files.sort(compare);
++}
++
++export async function searchApi(rootPath: string | undefined, query: unknown, offset: unknown = 0) {
++    const input = queryArguments(query, offset);
++    if (!rootPath) throw new Error("CODEQL_CPP_ALL_ROOT is required for pinned cpp-all source search");
++    const root = await realpath(rootPath);
++    const files = await qllFiles(root);
++    if (!files.length) throw new Error("Pinned cpp-all source pack is unavailable or contains no .qll files");
++    const sources = new Map<string, string[]>();
++    const hits: { path: string; line: number; name: string; rank: number; declaration: boolean }[] = [];
++    for (const path of files) {
++        const source = await readFile(path, "utf8");
++        const name = relative(root, path);
++        sources.set(name, source.split(/\r?\n/));
++        // Lexical source lookup only: mask strings/comments without changing line positions.
++        const lines = source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"/g,
++            value => value.replace(/[^\n]/g, " ")).split(/\r?\n/);
++        lines.forEach((line, index) => {
++            const declaration = line.match(/^\s*(?:(?:private|abstract|cached|override|final|transient|additional|extensible)\s+)*class\s+([A-Za-z_][A-Za-z_0-9]*)\b/) ??
++                line.match(/^\s*(?:(?:private|abstract|cached|override|final|transient|additional|extensible)\s+)*(?:predicate|int|float|string|boolean|date|[A-Z][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*)\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(/);
++            const names = [...new Set(line.match(/[A-Za-z_][A-Za-z_0-9]*/g) ?? [])]
++                .map(token => ({ name: token, rank: rank(token, input.query), declaration: token === declaration?.[1] }))
++                .filter(token => token.rank < 3)
++                .sort((a, b) => Number(b.declaration) - Number(a.declaration) || a.rank - b.rank || compare(a.name, b.name));
++            if (names.length) hits.push({ path: name, line: index + 1, ...names[0] });
++        });
++    }
++    hits.sort((a, b) => Number(b.declaration) - Number(a.declaration) || a.rank - b.rank ||
++        compare(a.path, b.path) || a.line - b.line);
++    const items = hits.slice(input.offset, input.offset + 10).map(hit => {
++        const lines = sources.get(hit.path)!;
++        const start = Math.max(0, hit.line - 6);
++        const end = Math.min(lines.length, start + 20);
++        const excerpt = lines.slice(start, end).join("\n");
++        const characters = [...excerpt];
++        return { path: hit.path, line: hit.line, name: hit.name,
++            match_kind: hit.declaration ? "declaration_hint" : "identifier",
++            source_start_line: start + 1, source: characters.slice(0, 2000).join(""),
++            truncated: { before: start > 0, after: end < lines.length, characters: characters.length > 2000 } };
++    });
++    return { pack: "codeql/cpp-all", version: CPP_ALL_VERSION, query: input.query,
++        position_encoding: "1-based source lines", lookup: "lexical_source_not_type_resolution", items,
++        pagination: { offset: input.offset, limit: 10, total: hits.length, hasMore: input.offset + 10 < hits.length } };
++}
+diff --git a/tests/api-tools.test.mjs b/tests/api-tools.test.mjs
+new file mode 100644
+index 0000000..37e26d2
+--- /dev/null
++++ b/tests/api-tools.test.mjs
+@@ -0,0 +1,111 @@
++import assert from "node:assert/strict";
++import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import test from "node:test";
++import { completePage, queryArguments, searchApi } from "../dist/api-tools.js";
++
++async function fixture(t) {
++    const root = await mkdtemp(join(tmpdir(), "ql-api-test-"));
++    t.after(() => rm(root, { recursive: true, force: true }));
++    return root;
++}
++
++test("completion filters the full collection before paging and keeps native fields", () => {
++    const items = Array.from({ length: 40 }, (_, i) => ({ label: `A${i}` }));
++    const warning = "Note: getAQlClass is a debugging tool. It is not suitable for production QL code.";
++    items.push({ label: "getAQlClass", documentation: warning, textEdit: { newText: "getAQlClass()" } });
++    const page = completePage({ isIncomplete: true, items }, "getAQlClass");
++    assert.equal(page.items.length, 1);
++    assert.equal(page.items[0].documentation, warning);
++    assert.equal(page.items[0].textEdit.newText, "getAQlClass()");
++    assert.equal(page.pagination.total, 1);
++    assert.equal(page.unfiltered_total, 41);
++    assert.equal(page.isIncomplete, true);
++});
++
++test("completion ranking is exact, case-insensitive, then substring with stable pages", () => {
++    const items = [{ label: "AnEQExpr" }, { label: "eqexpr" }, { label: "EQExpr" }];
++    assert.deepEqual(completePage({ isIncomplete: false, items }, "EQExpr").items.map(x => x.label),
++        ["EQExpr", "eqexpr", "AnEQExpr"]);
++    const many = Array.from({ length: 45 }, (_, i) => ({ label: `Item${String(i).padStart(2, "0")}` }));
++    const first = completePage({ isIncomplete: false, items: many.reverse() });
++    const second = completePage({ isIncomplete: false, items: many }, "", 20);
++    assert.equal(first.items.length, 20);
++    assert.equal(second.items[0].label, "Item20");
++    assert.equal(second.pagination.total, 45);
++    assert.equal(second.pagination.hasMore, true);
++    assert.equal(completePage({ isIncomplete: false, items: many }, ".*").items.length, 0);
++});
++
++test("query and pagination validation is bounded and literal", () => {
++    for (const query of ["", " ", null, 3, "x".repeat(129), "a\0b"]) {
++        assert.throws(() => queryArguments(query));
++    }
++    for (const offset of [-1, true, 0.2, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
++        assert.throws(() => queryArguments("Expr", offset));
++    }
++    assert.equal(queryArguments(".*").query, ".*");
++    assert.equal(queryArguments("", 0, true).query, "");
++});
++
++test("search ranks declarations, preserves positions and does not index comments or strings", async t => {
++    const root = await fixture(t);
++    await writeFile(join(root, "a.qll"), '// class FakeExpr {}\nstring x() { result = "class FakeExpr {}" }\n' +
++        "class AnotherEQExpr {}\nclass eqexpr {}\nclass EQExpr {}\n");
++    const result = await searchApi(root, "EQExpr");
++    assert.deepEqual(result.items.map(x => x.name), ["EQExpr", "eqexpr", "AnotherEQExpr"]);
++    assert.equal(result.items[0].line, 5);
++    assert.equal(result.items[0].path, "a.qll");
++    assert.equal(result.version, "7.0.0");
++    assert.equal((await searchApi(root, "FakeExpr")).items.length, 0);
++    assert.equal((await searchApi(root, ".*")).items.length, 0);
++    assert.equal((await searchApi(root, "UnfindableApi")).pagination.total, 0);
++});
++
++test("search has ten-item stable pages and bounded marked excerpts", async t => {
++    const root = await fixture(t);
++    await writeFile(join(root, "a.qll"), Array.from({ length: 25 }, (_, i) =>
++        `class Item${i} { // ${"x".repeat(250)}\n}`).join("\n"));
++    const first = await searchApi(root, "Item");
++    const second = await searchApi(root, "Item", 10);
++    assert.equal(first.items.length, 10);
++    assert.equal(first.pagination.total, 25);
++    assert.equal(second.items[0].line, 21);
++    assert.deepEqual(second, await searchApi(root, "Item", 10));
++    assert.ok(first.items[0].source.length <= 2000);
++    assert.ok(first.items[0].source.split("\n").length <= 20);
++    assert.equal(first.items[0].truncated.characters, true);
++    assert.equal(second.items[0].truncated.before, true);
++    assert.equal(first.items[0].truncated.after, true);
++    assert.equal((await searchApi(root, "Item", 30)).pagination.hasMore, false);
++});
++
++test("boolean connective followed by a call is not a declaration", async t => {
++    const root = await fixture(t);
++    await writeFile(join(root, "a.qll"), "  or target()\n  and target()\n  not target()\n");
++    await writeFile(join(root, "z.qll"), "predicate target() { any() }\n");
++    const result = await searchApi(root, "target");
++    assert.equal(result.items[0].path, "z.qll");
++    assert.ok(result.items.slice(1).every(x => x.match_kind === "identifier"));
++});
++
++test("search does not follow file/directory symlinks or read other file types", async t => {
++    const root = await fixture(t);
++    const pack = join(root, "pack");
++    await mkdir(pack);
++    await writeFile(join(root, "outside.qll"), "class SecretExpr {}\n");
++    await writeFile(join(pack, "safe.qll"), "class SafeExpr {}\n");
++    await writeFile(join(pack, "ignored.txt"), "class SecretExpr {}\n");
++    await symlink(join(root, "outside.qll"), join(pack, "escape.qll"));
++    await symlink(root, join(pack, "escape-directory"));
++    assert.equal((await searchApi(pack, "SecretExpr")).items.length, 0);
++    assert.deepEqual((await searchApi(pack, "Expr")).items.map(x => x.name), ["SafeExpr"]);
++});
++
++test("missing or empty dependency is an error rather than an empty match", async t => {
++    const root = await fixture(t);
++    await assert.rejects(searchApi(undefined, "Expr"), /ROOT/);
++    await assert.rejects(searchApi(join(root, "missing"), "Expr"), /ENOENT/);
++    await assert.rejects(searchApi(root, "Expr"), /unavailable/);
++});
 diff --git a/tests/diagnostics.test.mjs b/tests/diagnostics.test.mjs
 new file mode 100644
 index 0000000..df067da

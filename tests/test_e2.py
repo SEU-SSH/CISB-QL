@@ -55,6 +55,14 @@ class FakeMCP:
             receipt["calls"].append({"operation": name, "actor": "model", "status": "passed"})
             if self.fail_tool:
                 raise MCPError("offline MCP tool failure")
+            if name == "codeql_search_api":
+                return {"query": params["query"], "items": [],
+                        "pagination": {"offset": params["offset"], "limit": 10, "total": 0, "hasMore": False}}
+            if name == "codeql_complete":
+                return {"query": params["query"], "isIncomplete": False,
+                        "items": [{"label": "getAQlClass", "detail": "string getAQlClass()",
+                                   "documentation": "Debugging tool. Not suitable for production QL code."}],
+                        "pagination": {"offset": params["offset"], "limit": 20, "total": 1, "hasMore": False}}
             return {"contents": "Function documentation"}
 
         client.invoke = invoke
@@ -189,9 +197,9 @@ class ToolBoundaryTests(unittest.TestCase):
         (self.directory / "query.qll").write_text("// a\U0001f600b\nimport cpp\n")
         self.client = CandidateMCP(None, self.directory, 1, {"calls": []})
 
-    def test_only_three_read_only_tools_are_advertised(self):
+    def test_only_four_read_only_tools_are_advertised(self):
         self.assertEqual({tool["name"] for tool in model_tools()},
-                         {"codeql_hover", "codeql_definition", "codeql_complete"})
+                         {"codeql_hover", "codeql_definition", "codeql_complete", "codeql_search_api"})
 
     def test_utf16_boundary_and_completion_limit(self):
         args = {"file": "query.qll", "line": 0, "character": 6}
@@ -254,6 +262,7 @@ class E2BatchTests(unittest.IsolatedAsyncioTestCase):
         entry.parent.mkdir(parents=True)
         entry.write_text("offline MCP fixture")
         entry.with_name("codeql-lsp-client.js").write_text("offline MCP fixture")
+        entry.with_name("api-tools.js").write_text("offline API search fixture")
         (entry.parent.parent / "package-lock.json").write_text("{}")
         env = patch.dict(os.environ, {"CODEQL_MCP_ENTRY": str(entry)})
         env.start()
@@ -279,6 +288,9 @@ class E2BatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(experiment["mcp"], "on")
         self.assertEqual(experiment["model_policy"]["max_requests_per_attempt"], 14)
         self.assertEqual(experiment["summary"][0]["model_tool_calls"], 1)
+        self.assertEqual(experiment["revision"], "E3-r2")
+        self.assertIn(str(self.root / "mcp/dist/api-tools.js"), experiment["mcp_environment"]["files_sha256"])
+        self.assertEqual(experiment["mcp_environment"]["tool_policy"]["search_page_size"], 10)
 
     async def test_missing_mcp_deployment_fails_before_model(self):
         args = run.arguments(["--spec", "specs/a_spec.md", "--mcp", "on", "--out", "runs/missing"])

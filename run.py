@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from agent_backend import API_FORMAT, ResponsesBackend, redact
 from codeql_tools import CodeQL, load_pack, mcp_session, model_tools, write_pack, CODEQL_VERSION, CPP_ALL_VERSION
+from codeql_tools import TOOL_POLICY, cpp_all_root
 from harness import input_error_summary, load_config, run_sample, save_json
 from spec_io import collect_targets, parse_spec, source_id
 
@@ -75,14 +76,17 @@ async def run_batch(root, args, backend_factory=ResponsesBackend, compiler_facto
     tool_budget = config["max_tool_calls_per_attempt"] if args.mcp == "on" else 0
     if args.mcp == "on":
         entry = Path(os.environ.get("CODEQL_MCP_ENTRY", str(Path.home() / "codeql-lsp-mcp/dist/index.js"))).resolve()
-        mcp_environment = {"entry": str(entry), "files_sha256": {
+        deployment = {entry, entry.with_name("codeql-lsp-client.js"), entry.with_name("api-tools.js"),
+                      entry.parent.parent / "package-lock.json", *entry.parent.rglob("*.js")}
+        mcp_environment = {"entry": str(entry), "cpp_all_root": str(cpp_all_root()),
+                           "cpp_all_version": CPP_ALL_VERSION, "tool_policy": TOOL_POLICY, "files_sha256": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (entry, entry.with_name("codeql-lsp-client.js"), entry.parent.parent / "package-lock.json")}}
+            for path in sorted(deployment)}}
         if mcp_factory is None:
             def mcp_factory(path, receipt, stderr_path):
                 return mcp_session(path, executable, entry, config["timeout_seconds"], receipt, stderr_path)
     code_files = ("run.py", "harness.py", "agent_backend.py", "codeql_tools.py", "spec_io.py", "requirements.txt")
-    experiment = {"stage": "E3", "api_format": API_FORMAT, "status": "running", "mcp": args.mcp, "config": config,
+    experiment = {"stage": "E3", "revision": "E3-r2", "api_format": API_FORMAT, "status": "running", "mcp": args.mcp, "config": config,
                   "smoke_requested": args.smoke,
                   "mcp_environment": mcp_environment, "model_tools": model_tools() if args.mcp == "on" else [],
                   "versions": {"python": sys.version, "openai": version("openai"), "mcp": version("mcp"),

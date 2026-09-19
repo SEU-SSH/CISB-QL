@@ -1,10 +1,14 @@
 # 从 Spec 生成有效 QL：轻量研究实验计划
 
-更新日期：2026-09-11。
+当前实现修订：E3-r2。2026-09-20（Asia/Shanghai）更新使用定位：**当前增强 Harness 的 `--mcp off` 作为研究基线与后续实际使用路径；MCP-on 保留为待改进的实验方案。**下文历史实验日期及结果保留，不创建或切换 Git 分支。
 
 定位：单机、串行、固定模型的小型研究原型，不建设通用 Agent 平台。在 `~/qlcoder-cpp-lite/` 独立实施；本文保留实验设计，实际部署与验收以实施状态及回执为准。
 
 实施状态：E0 环境及用户运行的 Responses 探针已通过；E1 CLI 闭环、E2 MCP 接入已实现。`e2-debug-1` / `e2-debug-1-no-mcp` 真实单样本对照仅作 pilot。E3 的 smoke、旧候选独立复验与 A/B 汇总已实现，94 项本地测试全部通过，两份真实 E2 查询在双库复验通过且均为零行。冻结方案下的 A/B 各三次正式重复现已完成，共 18 个样本运行，三次修复内两组均通过 9/9；本批未请求 smoke，语义仍未评估。17 个冻结文件核对通过，完整结果见 `runs/E3-formal-report/` 与 `README.md`。
+
+E3-r2 的实现验收只做了离线与真实本地工具检查，记录见 `revisions/E3-r2.md`。其后单独授权的 2026-09-17 五用例、单轮 A/B 已完成：两组最终均通过 5/5，A/B 首轮为 4/5、2/5，平均修复为 0.6、1.4；B 耗时为 A 的 2.13 倍，usage 完整的四对样本 token 为 5.79 倍。本轮未观察到整体编译收益，不能据此推断 MCP 普遍有害或性能下降的因果关系。完整证据和定位决策见 [状态记录](revisions/20260920-baseline-and-mcp-status.md) 及第 7.6 节。
+
+本次仅更新文档，不修改代码、prompt、模型配置、五个 spec 或原始结果，也不新增 probe/A/B。旧 `e3-r2-freeze.sha256` 保持不变；其中 README 和本文因本次文档更新不再匹配，旧版应从实验 `source.tar.gz` 复验，后续新实验另行冻结。**CLI 的代码默认值仍为 on，基线命令必须显式传 `--mcp off`。**
 
 ## 1. 核心目标与精简边界
 
@@ -31,9 +35,19 @@
 | 旧 Querier 全量基线 + 新增 20～30 个能力 spec | 先少量调试，再直接对固定的现有 CISB spec 做 A/B |
 | 90%/95% 等硬门槛、MCP 必须提升 10 个百分点 | 报告实际效果、成本和失败原因，不预设研究结论 |
 
-必须保留：单 Agent、MCP/LSP 辅助、CLI 裁决、双文件输出、初次生成加最多三次修复、原始诊断、固定输入/版本，以及公平的 A/B 对照。
+基线必须保留：单 Agent、CLI 裁决、双文件输出、初次生成加最多三次修复、原始诊断、固定输入/版本、逐候选记录与可选 smoke。MCP/LSP 是保留实现的可选实验方案，不是实际生成的必需条件；再次研究其收益时才另行声明公平的 A/B 对照，不自动重跑。
 
 不加入 RAG、CVE 获取、AST diff、多 Agent、多模型切换、全局数据流/path query、SARIF、Refiner、spec 回写或准确率评测。静态 CISB 定义可以作为两组共用的 prompt 上下文。
+
+### 1.1 当前基线与 MCP 的边界
+
+- 基线是现有新 Harness 的 off 路径，不是回退到旧 Querier，也不是回退到最初 E1 快照。格式修复、环境预检、CLI 错误分类（含 E3-r2 递归修正）、完整候选/响应/诊断记录、成本统计、独立复验和汇总能力继续保留。
+- 旧 Querier 已有双文件生成、编译和默认三次修复；不能把整个编译闭环都算作本计划新增，也不能用本轮 A/B 证明新版优于旧版。其主循环使用完整 compile；新基线使用 `--check-only`，完整执行另看 smoke。
+- off 不启动 MCP/LSP，不向模型提供搜索/hover/definition/completion；保留现有 Python 依赖，不在本次拆包或变更部署。
+- on 保留源码、补丁、测试和历史回执。已观察到局部 API 采用，但存在声明片段查询空返、AST/IR 等同名结果混杂、修复查询偏离诊断、上下文开销大等问题。它们是后续研究问题，不以扩大工具预算作为当前解决方案。
+- 最终 5/5 仅指编译检查通过。移位候选以源码行序近似 spec 要求的 CFG 支配关系，说明语义意图仍可能弱化；两组都没有已验证的语义正确性结论。
+
+后续优先检查检索契约/相关性、诊断驱动的修复选择及上下文成本，并另行设计少量语义正负例。这些是待研究方向，不是已实现能力；本次不增加自动调度、额外模型调用或新的工程框架。
 
 ## 2. 最小目录和重构范围
 
@@ -78,6 +92,8 @@
 沿用上一轮核对的版本，不追求最新工具：CodeQL CLI `2.24.3`、`codeql/cpp-all` `7.0.0`、Python 3.13、Node 24。Python/Node 的实际 patch、模型 ID、MCP 提交和修改记录统一记在 README；每批实验保存该记录与实际配置的副本。
 
 QLCoder 只作方法参考，不需要克隆和启动其完整环境。实际复用 `codeql-lsp-mcp`，它通过 stdio 启动 CodeQL 自带的 LSP，无需 VS Code、独立 LSP 安装包或 HTTP 服务。[R1][R2]
+
+以下保留完整实验环境的部署记录。日常 off 基线只运行模型后端和 CLI，无需启动或重建 MCP 服务；Node/MCP 服务部署用于保留的 on 实验方案，现有 Python `mcp` 依赖仍保留。
 
 ### 3.1 Python 与配置
 
@@ -223,7 +239,15 @@ Prompt 提供完整 spec、固定版本和模板，只使用普通 AST/局部结
 
 保留原始 output 和 usage，新回执标记 `api_format: responses`，汇总使用 `input_tokens`、`output_tokens`、`total_tokens`，推理 token 已包含在 output 中，不重复相加。旧 Chat Completions 回执不改写；正式 A/B 组使用相同 API 格式。E0 本地工具无需重新部署，但切换后应重跑两请求上限的 Responses 模型探针，旧 Chat 探针通过不代表网关支持新接口。E2 的工具次数仍由客户端计数，不依赖服务端 `max_tool_calls`。
 
-Harness 管理 workspace、open 和 diagnostics。模型只访问 `codeql_hover`、`codeql_definition`，必要时使用最多 20 项的 `codeql_complete`。definition 可附锁定库中少量相邻源码；不开放任意文件、shell、安装或写文件工具。位置遵守 LSP 的 0-based/UTF-16 约定。
+Harness 管理 workspace、open 和 diagnostics。模型访问四个只读工具：`codeql_hover`、`codeql_definition`、`codeql_complete` 和 `codeql_search_api`。definition 可附锁定库中少量相邻源码；不开放任意文件、shell、安装或写文件工具。位置工具遵守 LSP 的 0-based/UTF-16 约定，名称搜索不需要源码位置。
+
+E3-r2 的最小工具契约：
+
+- `codeql_search_api(query, offset=0)` 在 MCP 服务端检索固定 cpp-all 7.0.0 的 `.qll` 源码。库根由 Harness 通过 `CODEQL_CPP_ALL_ROOT` 传入，复用 definition 的固定库边界；模型不能指定目录、版本或任意文件，也不跟随符号链接。query 是非空、最多 128 字符的字面量，不作为正则执行。
+- 搜索每页十处，给出版本、相对路径、1-based 行号、最多二十行/两千字符的相邻源码及截断标志。声明线索优先于普通标识符命中；组内按精确、忽略大小写、子串匹配排序，同级按路径、行号排序。仅作词法源码定位，不承诺声明识别完整、继承解析或接收类型兼容；实验性/内部接口也可能命中，允许分页或收窄关键词。
+- `codeql_complete(file, line, character, query="", offset=0)` 在服务端对完整 LSP 返回集合过滤名称后，再取每页二十项。保留过滤后总数、原始总数和 `isIncomplete`。模型只接收名称、种类、详情、完整文档及分页信息，调试用途/弃用警告不截掉；原始 MCP 回执仍保存。
+- 同一生成轮内，完全相同的 completion 名称、详情、文档、分页与完整性信息可引用前次 call_id；跨轮重置。搜索、翻页、重复调用和参数错误均占用原有六次预算，不追加隐形查询。
+- 未知名称优先搜索，修复围绕编译器指出的名称/位置，必要时用 definition/hover 核对签名。工具调用可选，不硬编码样例 API 映射，不删除完整历史反馈，不引入草稿编辑或会话复用。
 
 每轮最多 6 次模型选择的工具调用，正常模型请求最多为工具预算加一次最终提交，不额外配置另一套轮次。提交失败算本轮格式错误，不能无限重问。传输失败最多重试一次，鉴权错误直接结束；只设一层重试，实际 API 调用和 token 均记录。所有模型/MCP/CLI 操作使用配置中的超时，取消时回收相关子进程。
 
@@ -261,6 +285,8 @@ Spec -> Agent -> 双文件 JSON -> 候选目录
 反馈只保留必要内容：完整 spec、失败轮次/剩余次数、上一轮原始输出与完整双文件、格式错误、LSP/CLI 诊断、相关工具结果和环境版本。未执行的阶段明确标为未执行。模型看到的普通输出可限长，但不能丢掉当前 error 的位置/消息；原文全部落盘。
 
 不建设复杂异常分类框架。summary 区分输入错误、生成/编译失败、基础设施失败即可，再用文本原因描述；不把所有非零退出码都当 QL 错误。不能确定原因时标记待检查，不虚构分类。
+
+E3-r2 对非单调递归增加窄范围例外：每条外部 ERROR 都须位于固定 cpp-all 库内，并在闭合递归链中显式包含与本地递归诊断对应的完整 `query::` 自定义符号，才继续 QL 修复。超时、缺包、资源错误等判定仍优先；仅标准库报错、不相关递归链和未知格式仍保守处理。原始诊断不删减，继续使用剩余预算，不增加候选或编译次数。新增回归使用手写夹具，不依赖或改写历史 runs。
 
 ## 6. smoke 检查和最少日志
 
@@ -338,7 +364,9 @@ runs/<batch>/
 
 ## 7. 实验设置和运行入口
 
-### 7.1 只保留一组核心 A/B
+### 7.1 保留的 A/B 研究设计
+
+当前实际使用推荐 off；本节是未来另行授权 MCP 实验时的对照口径，不是要求立即再跑一轮。
 
 先用 3～5 个现有 spec 调通流程和 prompt，再固定 samples、spec 快照、prompt 与代码版本。正式实验直接使用选定的现有 CISB spec，不强制补建 20～30 个能力 spec，也不要求先跑完旧 Querier 基线。记录调试集与正式集是否重合，避免隐藏调参过程。
 
@@ -368,32 +396,37 @@ MCP 失败属于 B 组基础设施失败，不能悄悄作为 A 组结果使用�
 
 ### 7.3 一个入口
 
-单样本和串行批量入口已实现，支持 MCP on/off 和 `--smoke`。`samples.txt` 每行一个相对项目根的 spec 路径，单文件和批量共用同一函数；批量串行运行，失败样本写日志后继续。
+单样本和串行批量入口已实现，支持 MCP on/off 和 `--smoke`。样本清单每行一个相对项目根的 spec 路径；当前推荐五例清单 `samples-5.txt`，保留三例清单 `samples.txt` 供历史参照。单文件和批量共用同一函数；批量串行运行，失败样本写日志后继续。
 
 ```bash
 cd "$HOME/qlcoder-cpp-lite"
-# 开发时运行单个样本。
-.venv/bin/python run.py --spec specs/12051b318b_spec.md --mcp on --out runs/debug
-# 正式对照，rep1/rep2/rep3 使用不同结果目录。
-.venv/bin/python run.py --samples samples.txt --mcp off --out runs/A-rep1
-.venv/bin/python run.py --samples samples.txt --mcp on --out runs/B-rep1
+# 推荐：日常单样本与五用例批量生成，均显式关闭 MCP。
+.venv/bin/python run.py --spec specs/12051b318b_spec.md --mcp off --out runs/baseline-off-single-20260920
+.venv/bin/python run.py --samples samples-5.txt --mcp off --out runs/baseline-off-batch-20260920
 # 可选：成功编译后执行固定的两个 smoke 数据库。
-.venv/bin/python run.py --samples samples.txt --mcp on --smoke --out runs/B-smoke
+.venv/bin/python run.py --samples samples-5.txt --mcp off --smoke --out runs/baseline-off-smoke-20260920
 # 无模型调用：复验已保存的成功候选，输出必须在原批次之外。
-.venv/bin/python run.py --smoke-from runs/e2-debug-1 --out runs/e3-smoke-B
-# 显式输入三次重复，A/B 列表顺序一一对应。
+.venv/bin/python run.py --smoke-from runs/E3-r2-5spec-20260917T085049.069920Z/A --out runs/baseline-off-recheck-20260920
+```
+
+上述生成命令调用真实模型并可能收费，输出目录都必须尚不存在。以下仅保留未来另行冻结/授权的 A/B 示例，不是日常使用步骤；根据预先声明的重复次数逐批运行：
+
+```bash
+.venv/bin/python run.py --samples samples-5.txt --mcp off --out runs/A-rep1
+.venv/bin/python run.py --samples samples-5.txt --mcp on --out runs/B-rep1
+# 若事先声明并已完成三次重复，A/B 列表顺序一一对应；汇总本身不调用模型。
 .venv/bin/python report.py \
   --a runs/A-rep1 runs/A-rep2 runs/A-rep3 \
   --b runs/B-rep1 runs/B-rep2 runs/B-rep3 \
-  --purpose formal --overlap-note "All three specs also used for debugging; no held-out evaluation" \
+  --purpose formal --overlap-note "All five specs overlap earlier runs; no held-out evaluation" \
   --out runs/formal-report
 ```
 
-默认读取项目根 `config.json`，默认 MCP on。`--smoke` 固定使用第 6 节两个数据库，无任意数据库列表或配置 profile。全体样本达到请求关卡时退出 0，否则非零，具体原因以 summary 为准。不实现 resume/skip-existing、并发队列或服务模式。
+默认读取项目根 `config.json`。**代码默认 MCP on 尚未改变；推荐使用方式是显式 `--mcp off`，省略该参数不是基线。**`--smoke` 固定使用第 6 节两个数据库，无任意数据库列表或配置 profile。全体样本达到请求关卡时退出 0，否则非零，具体原因以 summary 为准。不实现 resume/skip-existing、并发队列或服务模式。
 
 汇总输出 `report.json`（逐样本、逐重复、组汇总、配对结果和来源哈希）与 `report.md`。严格检查两组输入集合/哈希、prompt、配置、代码、API、工具链和共同策略一致；B 组重复还需 MCP 部署一致。拒绝模拟模型回执、重复目录、未完成批次或错分组，不自动扫描并筛选最优结果。预检后未运行的合法样本及基础设施失败仍在分母；缺 usage 保留未知及已知小计。已编译但 smoke 失败不撤销编译成功。
 
-`--purpose pilot/formal` 与调试重合说明必填。正式少于三次重复需用 `--note` 说明预算；声明为 formal 本身不证明统计稳定。当前三份 spec 仍可作为小规模固定集合，但必须披露全部与调试集重合；现有 E2 单样本对照只做 pilot，不能混入 E3 新代码的正式重复。模型、prompt、token 预算保持原值，完整 fish 命令见 README。
+`--purpose pilot/formal` 与调试重合说明必填。正式少于三次重复需用 `--note` 说明预算；声明为 formal 本身不证明统计稳定。当前五份 spec 均已用于旧实验，不是独立保留测试集；三例历史集合和 E2 单样本 pilot 不能直接混入新修订的正式重复。模型、prompt、token 预算保持原值，完整 fish 命令见 README。
 
 ### 7.4 已完成的正式编译实验
 
@@ -436,15 +469,35 @@ B 记录的 QL 失败轮次较少，但额外五次格式失败抵消了总修�
 | 模型主动工具调用次数 | 0 | 19 |
 | 总 token | 503,902 | 696,462 |
 
-**必须保留的限制：**B 的移位用例在 `attempt_1/query.qll:10-15` 中用 `getAQlClass()` / `getAPrimaryQlClass()` 定义 `ShiftOperation`，编译器报告非单调递归。九条错误中的两条定位到生成文件，七条定位到标准库；当前 `classify_compile` 只接受全部定位在生成双文件中的错误为 QL 失败，因此将该轮归为基础设施失败，处理两个候选后停止，剩余两次修复未使用。这不是 API 超时、MCP 故障或 pack 缺失，不能写成 B 已用尽四候选预算仍失败。
+**必须保留的历史限制：**B 的移位用例在 `attempt_1/query.qll:10-15` 中用 `getAQlClass()` / `getAPrimaryQlClass()` 定义 `ShiftOperation`，编译器报告非单调递归。九条错误中的两条定位到生成文件，七条定位到标准库；当时的 `classify_compile` 只接受全部定位在生成双文件中的错误为 QL 失败，因此将该轮归为基础设施失败，处理两个候选后停止，剩余两次修复未使用。这不是 API 超时、MCP 故障或 pack 缺失，不能写成 B 已用尽四候选预算仍失败。E3-r2 修正后不追改本表，不推断剩余修复一定成功。
 
-原始分类、候选和回执未回写或重标，自动表保持 QL 失败 2 次、基础设施失败 1 次；诊断复核需额外说明其中 1 次是被误分类的查询递归错误。B 的平均修复次数只使用四个成功样本，不能忽略提前中止样本而宣称无条件优势。当前不修改冻结代码；后续应以混合标准库/本地定位的递归错误作为回归用例修复分类，再另行声明新实验，不补跑替换本轮结果。
+原始分类、候选和回执未回写或重标，自动表保持 QL 失败 2 次、基础设施失败 1 次；诊断复核需额外说明其中 1 次是被误分类的查询递归错误。B 的平均修复次数只使用四个成功样本，不能忽略提前中止样本而宣称无条件优势。上述为 2026-09-12 的冻结行为；其后 E3-r2 已用独立回归夹具修正分类，2026-09-17 另行执行了第 7.6 节实验，没有补跑替换本轮结果。
 
 逐例成功候选索引（0 为首次）为：A `3, 3, 1, 2, 0`；B `0, 0, 1, 0, 未通过`。B 的内联汇编与清零用例没有主动调用模型工具，移位用例则在七次工具调用后仍因上述问题停止。因此不能把所有首轮差异归因于工具检索。B 的耗时为 A 的 1.34 倍、token 为 1.38 倍；五对单次观察仅支持描述性比较，不证明 MCP 的普遍收益、接口更换的因果效果或语义检测准确率。
 
 本轮二十八次模型响应均完成、usage 完整且加总一致，十二个 MCP 会话均记录关闭，MCP 故障数为零。实验前后新二十项和旧十七项冻结控制均匹配，历史六批元数据及原汇总哈希不变。离线检查通过八十三项，十一项真实工具集成未启用；两组实际批次另有真实 CLI 预检和 B 的 MCP/LSP 调用记录。
 
+### 7.6 E3-r2 五用例单轮结果与当前决策
+
+2026-09-17 在单独授权后执行 A off、B on 各一次，每组五个固定 spec；首次生成加最多三次修复、每候选最多六次模型工具调用，未补跑、未新增 probe，未请求 smoke。模型配置、版本和输入保持一致。实验目录为 `runs/E3-r2-5spec-20260917T085049.069920Z/`，以其中 `protocol.json`、`report/report.json` 和 `report/verification.json` 为依据。
+
+| 指标 | A：MCP off | B：MCP on |
+|---|---:|---:|
+| 首次编译通过 | 4/5 | 2/5 |
+| 三次修复内编译通过 | 5/5 | 5/5 |
+| 成功样本平均修复次数 | 0.6 | 1.4 |
+| QL 失败候选 | 3 | 7 |
+| 生成与编译总秒数 | 750.035 | 1600.290 |
+| 模型主动工具调用 | 0 | 56 |
+| usage 完整的四对样本 token | 189690 | 1097367 |
+
+A 的清零案例一次连接失败缺 usage，已有策略下重试成功；不能当作新一轮实验或把缺失 usage 当零。5.79 倍 token 只对应两组共同的四个完整样本，不是五样本精确成本比；耗时比为 2.13。56 次工具调用由 49 次搜索、1 次 completion、6 次 definition 构成，无 MCP 故障。49 次搜索有 11 次空结果，其中 8 次是含空格的声明片段；个别案例确实采用正确 API，仍未带来本轮整体编译收益。
+
+**决策：**当前 off 基线用于后续实际生成，on 作为待改进方案保留。单轮、五个复用样本只能报告观察差异，不能证明 MCP 普遍有害、首轮下降的因果关系或新版优于旧 Querier。本轮没有非单调递归、completion 重复引用或 `getAQlClass` 警告场景，不把相应本地回归能力写成已取得实际生成收益。语义仍为 `not_evaluated`，详见 [日期化结论与问题记录](revisions/20260920-baseline-and-mcp-status.md)。
+
 ## 8. 四步实施与最小验收
+
+以下保留已实施阶段的职责与验收，不要求日常 off 基线重复执行 E2 或新一轮 E3 A/B。
 
 | 步骤 | 工作与产物 | 验收 |
 |---|---|---|

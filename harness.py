@@ -71,6 +71,7 @@ async def generate_with_tools(backend, prompt, payload, trace, context, budget, 
         return await backend.generate(prompt, inputs, trace)
     used = 0
     call_ids = set()
+    completions = {}
     for _ in range(budget + 1):
         response = await backend.generate(prompt, inputs, trace, tools=model_tools(),
                                           tool_choice="auto" if used < budget else "none")
@@ -93,6 +94,16 @@ async def generate_with_tools(backend, prompt, payload, trace, context, budget, 
             try:
                 arguments = json_object(call.get("arguments", ""))
                 result = await context.invoke(call.get("name"), arguments)
+                if call.get("name") == "codeql_complete":
+                    identity = json.dumps({key: result.get(key) for key in
+                                           ("items", "pagination", "isIncomplete")}, sort_keys=True)
+                    if identity in completions:
+                        result = {"duplicate_of": completions[identity],
+                                  "query": arguments.get("query", ""), "pagination": result.get("pagination"),
+                                  "message": "Same completion page as the earlier call. Change query or offset, "
+                                             "or use codeql_search_api for an unknown name."}
+                    else:
+                        completions[identity] = call["call_id"]
                 event["status"] = "passed"
             except (ValueError, TypeError) as error:
                 result = {"error": "invalid_tool_arguments", "message": str(error)}

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import time
 from urllib.parse import unquote, urlsplit
@@ -22,7 +23,14 @@ PACK_HASHES = {
     "codeql-pack.lock.yml": "712146adbcc9bfd2cf94b60e6abe76b65220c5a1404351304ed55ebcca830d9d",
 }
 PACK_FILES = (*PACK_HASHES, "query.qll", "query.ql")
-MODEL_TOOLS = ("codeql_hover", "codeql_definition", "codeql_complete")
+MODEL_TOOLS = ("codeql_hover", "codeql_definition", "codeql_complete", "codeql_search_api")
+TOOL_POLICY = {"search_page_size": 10, "completion_page_size": 20, "query_max_characters": 128,
+               "source_max_lines": 20, "source_max_characters": 2000,
+               "completion_deduplication": "within_generation_attempt"}
+
+
+def cpp_all_root():
+    return (Path.home() / ".codeql/packages/codeql/cpp-all" / CPP_ALL_VERSION).resolve()
 
 
 class MCPError(Exception):
@@ -33,12 +41,25 @@ def model_tools():
     properties = {"file": {"type": "string", "enum": ["query.ql", "query.qll"]},
                   "line": {"type": "integer", "minimum": 0, "description": "0-based source line"},
                   "character": {"type": "integer", "minimum": 0, "description": "0-based UTF-16 offset"}}
-    return [{"type": "function", "name": name,
-             "description": f"{name} on a read-only file in tool_context; completion is capped at 20 items. "
-                            "Inspect existing code only; submit the next complete pair as final JSON.",
-             "parameters": {"type": "object", "properties": properties,
-                            "required": list(properties), "additionalProperties": False}}
-            for name in MODEL_TOOLS]
+    query = {"type": "string", "maxLength": 128,
+             "description": "Literal identifier or fragment, not a regular expression"}
+    offset = {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+    tools = []
+    for name in MODEL_TOOLS:
+        fields, required = dict(properties), list(properties)
+        description = f"{name} on a read-only file in tool_context; submit the next complete pair as final JSON."
+        if name == "codeql_complete":
+            fields.update(query={**query, "default": ""}, offset={**offset, "default": 0})
+            description += " Filter names before pagination (20 items/page); query unknown APIs by name first."
+        elif name == "codeql_search_api":
+            fields = {"query": {**query, "minLength": 1}, "offset": {**offset, "default": 0}}
+            required = ["query"]
+            description = ("Find literal API names in pinned cpp-all 7.0.0 source (10 hits/page). "
+                           "No source position needed. Returns source evidence, not type resolution.")
+        tools.append({"type": "function", "name": name, "description": description,
+                      "parameters": {"type": "object", "properties": fields,
+                                     "required": required, "additionalProperties": False}})
+    return tools
 
 
 class CandidateMCP:
@@ -117,8 +138,25 @@ class CandidateMCP:
 
     def arguments(self, name, arguments):
         if name not in MODEL_TOOLS or not isinstance(arguments, dict):
-            raise ValueError("only hover, definition and completion are allowed")
-        if set(arguments) != {"file", "line", "character"} or arguments["file"] not in ("query.ql", "query.qll"):
+            raise ValueError("only hover, definition, completion and API search are allowed")
+        optional = {"query", "offset"} if name == "codeql_complete" else set()
+        required = {"query"} if name == "codeql_search_api" else {"file", "line", "character"}
+        if name == "codeql_search_api":
+            optional = {"offset"}
+        if not required <= set(arguments) or set(arguments) - required - optional:
+            raise ValueError("unexpected or missing tool arguments")
+        pagination = {}
+        if name in ("codeql_complete", "codeql_search_api"):
+            query, offset = arguments.get("query", ""), arguments.get("offset", 0)
+            if (not isinstance(query, str) or len(query) > 128 or "\x00" in query
+                    or (name == "codeql_search_api" and not query.strip())):
+                raise ValueError("query must be a literal string of at most 128 characters; search cannot be empty")
+            if type(offset) is not int or not 0 <= offset <= 9007199254740991:
+                raise ValueError("offset must be a nonnegative safe integer")
+            pagination = {"query": query, "offset": offset}
+        if name == "codeql_search_api":
+            return pagination
+        if arguments["file"] not in ("query.ql", "query.qll"):
             raise ValueError("use file query.ql/query.qll and integer line/character only")
         line, character = arguments["line"], arguments["character"]
         lines = self.files[arguments["file"]].decode("utf-8").split("\n")
@@ -133,12 +171,12 @@ class CandidateMCP:
             raise ValueError("character must be a UTF-16 character boundary within the line")
         result = {"file_uri": (self.directory / arguments["file"]).as_uri(), "line": line, "character": character}
         if name == "codeql_complete":
-            result.update(limit=20, offset=0)
+            result.update(limit=20, **pagination)
         return result
 
     def definition_sources(self, locations):
         sources = []
-        library = (Path.home() / ".codeql/packages/codeql/cpp-all" / CPP_ALL_VERSION).resolve()
+        library = cpp_all_root()
         items = locations if isinstance(locations, list) else [locations]
         for item in items[:5]:
             if not isinstance(item, dict):
@@ -171,9 +209,19 @@ class CandidateMCP:
         parameters = self.arguments(name, arguments)
         result = await self.request(name, parameters, actor="model", parse=True)
         if name == "codeql_complete":
-            if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            if (not isinstance(result, dict) or not isinstance(result.get("items"), list)
+                    or any(not isinstance(item, dict) or not isinstance(item.get("label"), str)
+                           for item in result["items"])):
                 raise MCPError("invalid completion result")
-            result["items"] = result["items"][:20]
+            items = result["items"]
+            result = {key: result[key] for key in ("query", "isIncomplete", "pagination", "unfiltered_total")
+                      if key in result}
+            # request() retains native MCP content; model-facing items exclude editor-only fields.
+            result["items"] = [{key: item[key] for key in ("label", "kind", "detail", "documentation") if key in item}
+                               for item in items[:20]]
+        if name == "codeql_search_api":
+            if not isinstance(result, dict) or not isinstance(result.get("items"), list) or len(result["items"]) > 10:
+                raise MCPError("invalid API search result")
         if name == "codeql_definition":
             return {"locations": result, "sources": self.definition_sources(result)}
         return result
@@ -186,8 +234,10 @@ async def mcp_session(directory, executable, entry, timeout, receipt, stderr_pat
     env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "JAVA_HOME", "LANG", "LC_ALL", "LD_LIBRARY_PATH")
            if key in os.environ}
     env["CODEQL_PATH"] = executable
+    env["CODEQL_CPP_ALL_ROOT"] = str(cpp_all_root())
     params = StdioServerParameters(command="node", args=[str(entry)], cwd=str(directory), env=env)
-    receipt["launch"] = {"command": params.command, "args": params.args, "cwd": params.cwd, "codeql": executable}
+    receipt["launch"] = {"command": params.command, "args": params.args, "cwd": params.cwd, "codeql": executable,
+                         "cpp_all_root": env["CODEQL_CPP_ALL_ROOT"], "cpp_all_version": CPP_ALL_VERSION}
     pending_error = None
     try:
         with stderr_path.open("w", encoding="utf-8") as log:
@@ -234,6 +284,18 @@ def write_pack(path, files):
         (path / name).write_bytes(content)
 
 
+def recursion_query_symbols(message, *, qualified=False):
+    prefix = "Non-monotonic recursion: "
+    if not isinstance(message, str) or not message.startswith(prefix):
+        return set()
+    nodes = re.split(r"\s+(?:-->|-!->)(?:\(via dispatch\))?\s+", message[len(prefix):])
+    if len(nodes) < 3 or nodes[0] != nodes[-1]:
+        return set()
+    qualifier = r"query::" if qualified else r"(?:query::)?"
+    pattern = r"characteristic predicate of " + qualifier + r"([A-Za-z_][A-Za-z_0-9]*)"
+    return {match[1] for node in nodes if (match := re.fullmatch(pattern, node))}
+
+
 def classify_compile(result, query):
     if result.get("timed_out") or result.get("launch_error"):
         return "infrastructure_error"
@@ -254,9 +316,20 @@ def classify_compile(result, query):
         errors = [message for report in reports for message in report.get("messages", [])
                   if message.get("severity") == "ERROR"]
         local_files = {query.resolve(), query.with_suffix(".qll").resolve()}
+        located = []
         for error in errors:
             filename = error.get("position", {}).get("fileName")
-            if not filename or (query.parent / filename).resolve() not in local_files:
+            if not isinstance(filename, str) or not filename:
+                return "infrastructure_error"
+            located.append((error, (query.parent / filename).resolve()))
+        symbols = set().union(*(recursion_query_symbols(error.get("message"))
+                                for error, path in located if path in local_files))
+        for error, path in located:
+            if path in local_files:
+                continue
+            # Library locations in a query-originated recursion cycle are not dependency failures.
+            if (path.suffix != ".qll" or not path.is_relative_to(cpp_all_root())
+                    or not symbols.intersection(recursion_query_symbols(error.get("message"), qualified=True))):
                 return "infrastructure_error"
         return "query_error" if errors else "infrastructure_error"
     except (ValueError, TypeError, AttributeError):

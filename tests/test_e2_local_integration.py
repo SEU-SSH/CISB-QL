@@ -53,7 +53,7 @@ class E2LocalTests(unittest.IsolatedAsyncioTestCase):
             requests.append(body)
             self.assertFalse(body["parallel_tool_calls"])
             self.assertEqual({tool["name"] for tool in body["tools"]},
-                             {"codeql_hover", "codeql_definition", "codeql_complete"})
+                             {"codeql_hover", "codeql_definition", "codeql_complete", "codeql_search_api"})
             index = len(requests) - 1
             if index == 0:
                 raw = generated("invalid JSON")

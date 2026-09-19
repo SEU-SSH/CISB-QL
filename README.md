@@ -1,16 +1,135 @@
 # QLCoder C/C++ Lite
 
+## Current Recommendation: MCP-Off Baseline
+
+Decision recorded on September 20, 2026 (Asia/Shanghai), based on the completed
+September 17 E3-r2 experiment: **use the current harness with explicit `--mcp off`
+as the research baseline and routine generation path**. Keep `--mcp on` as an
+experimental variant to improve, not a required step or an established enhancement.
+Here "variant" is a research/workflow distinction; no Git branch was created.
+
+The CLI parser still defaults to `on`. This documentation-only update does not
+change that behavior: **always pass `--mcp off` for baseline use**. Off mode starts
+no MCP/LSP session and exposes no model tools, but retains Responses generation,
+format/QL repair, CLI adjudication, error classification, receipts and optional
+smoke checks. The existing Python environment still includes the `mcp` package;
+off mode does not require starting or rebuilding the MCP server.
+
+With API environment variables already configured, choose a new output name:
+
+```fish
+cd ~/qlcoder-cpp-lite
+source env.sh
+# Paid generation, one serial batch of the five existing specs.
+.venv/bin/python run.py --samples samples-5.txt --mcp off --out runs/baseline-off-20260920
+```
+
+No new probe, A/B repetition or model request was run for this documentation
+decision. See [Recommended CLI-Only Baseline](#recommended-cli-only-baseline)
+for single-spec use and the existing optional smoke/independent-recheck workflow.
+
+### Latest Evidence: September 17, 2026
+
+Exactly one pair, five unchanged specs per group, A off then B on:
+
+| Metric | A (off) | B (on) |
+|---|---:|---:|
+| Initial compilation success | 4/5 | 2/5 |
+| Success within three repairs | 5/5 | 5/5 |
+| Mean repairs on success | 0.6 | 1.4 |
+| QL-failed candidates | 3 | 7 |
+| Generation/compilation time | 750.035 s | 1600.290 s |
+| Model-requested MCP calls | 0 | 56 |
+| Tokens, four pairs with complete usage | 189690 | 1097367 |
+
+Across all five specs, B took 2.13 times A's generation/compilation time. For the
+**four complete-usage pairs**, B used 5.79 times A's tokens. A/7185ad2672 had a
+connection failure with missing usage, so the exact
+whole-batch token ratio is unknown. There was no final compilation gain in this
+run. This small, reused set and one serial pair do not establish statistical
+significance, universal MCP harm, or an improvement over the old Querier.
+
+MCP did supply adopted API evidence (`PointerDereferenceExpr`, `isRValue`), but
+49 searches included 11 empty results, eight from declaration-phrase queries
+that do not match the identifier-only search. Other observed limitations were
+mixed AST/IR APIs, repair lookups away from compiler errors, and expensive
+retained context. P0's mixed-location recursion rule was not exercised in this
+live run. Semantic accuracy remains untested; the final shift query approximates
+required CFG dominance with source-line ordering. Compilation is not spec fidelity.
+
+The decision, baseline capabilities, evidence boundaries and deferred MCP work
+are recorded in [the status note](revisions/20260920-baseline-and-mcp-status.md).
+Raw results and detailed analysis remain in
+[the unchanged experiment report](runs/E3-r2-5spec-20260917T085049.069920Z/report/analysis.md).
+The historical implementation and experiment sections below are retained, not
+instructions to rerun or promote MCP-on for routine use.
+
 Research prototype following `syntax.md`. E0 tools and the user-run Responses
 protocol probe have passed. E1 provides the CLI-only generation/repair loop;
 E2 adds read-only MCP/LSP assistance to that same loop. The user's real-model
 `e2-debug-1` / `e2-debug-1-no-mcp` pair is preserved as pilot evidence. E3 adds
 compiled-query smoke checks and paired A/B aggregation. The frozen three-repeat
 A/B compilation experiment is complete: both groups compiled all nine sample
-runs within three repairs. Semantic accuracy is outside this phase. A separate
-five-spec single-round experiment is also complete; its B failure exposed the
+runs within three repairs. Semantic accuracy is outside this phase. The separate
+September 12 five-spec experiment is also complete; its B failure exposed the
 error-classification limitation documented below.
 
-## Five-Spec Single-Round Experiment
+## E3-r2: Local Implementation Acceptance
+
+E3-r2 fixes query-originated mixed-location recursion classification and adds
+targeted API lookup. It does not change the five specs, config, Responses backend,
+CodeQL 2.24.3, or cpp-all 7.0.0. The implementation acceptance itself used no paid
+probe or A/B. The separately authorized September 17 experiment is summarized
+above; its results do not rewrite the local acceptance record in `revisions/E3-r2.md`.
+
+- `codeql_search_api(query, offset=0)` is a real MCP server tool. It reads only
+  `.qll` files in the pinned library root supplied by the harness, without following
+  symlinks. No model-supplied directory or version is accepted. Literal queries
+  have at most 128 characters; empty search is invalid. No match is an empty
+  success, while an unavailable pack is a tool failure.
+- Search returns ten source locations per page, with 1-based line numbers,
+  version, up to twenty lines / 2,000 characters per excerpt, and truncation flags.
+  Declaration hints precede identifier occurrences; within each group, exact,
+  case-insensitive and substring matches are ordered by path and line. This is
+  lexical evidence, not a QL parser, type resolver, or curated public API index.
+  Broad terms can include experimental/internal APIs and require another page
+  or a narrower query. Nothing is hardcoded to the five sample identifiers.
+- `codeql_complete(file, line, character, query="", offset=0)` filters the full
+  LSP-returned collection before paging twenty items. It reports filtered total,
+  unfiltered total and `isIncomplete`. Model results omit editor fields but keep
+  full documentation, including debugging-only and deprecated-use warnings.
+- Identical completion pages within a generation attempt refer to the earlier
+  call. Search, pagination, duplicates and invalid arguments share the existing
+  six-call budget. Native MCP responses and model-facing results are both saved.
+- Mixed-location non-monotonic recursion is repairable only when every external
+  error belongs to the pinned pack and explicitly names a query-defined symbol
+  also present in a local recursion cycle. Other infrastructure guards remain.
+  The original diagnostic text is not removed from repair feedback.
+
+Current revision metadata hashes all deployed MCP JavaScript, including
+`api-tools.js`, and records tool schemas, bounds and the fixed search root.
+`e3-r2-freeze.sha256` is a separate implementation manifest, not a new experimental
+baseline. Old freeze files, archives and results remain unchanged; old manifests
+are expected not to match revised source. Future paid A/B needs a new disclosed
+freeze and cannot mix old/new implementation hashes. The September 20 update
+changes only this README and `syntax.md` from that 52-file manifest and adds a
+decision note. The old manifest is intentionally not regenerated: verify its
+documentation against the archived `source.tar.gz`, not the edited live files.
+
+```bash
+cd "$HOME/codeql-lsp-mcp"
+npm run build
+node --test --test-isolation=none --test-reporter=tap tests/*.test.mjs
+cd "$HOME/qlcoder-cpp-lite"
+env -u RUN_E0_TESTS -u RUN_E1_TESTS -u RUN_E2_TESTS -u RUN_E3_TESTS -u RUN_E3_R2_TESTS .venv/bin/python -m unittest discover -s tests -v
+env RUN_E0_TESTS=1 RUN_E1_TESTS=1 RUN_E2_TESTS=1 RUN_E3_TESTS=1 RUN_E3_R2_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+All model responses in these tests are mocked. The new local cases use
+handwritten recursion/repair fixtures, not model-generated research observations.
+No full-history pruning, LSP reuse, draft edits or new dependencies are introduced.
+
+## Historical Five-Spec Experiment: September 12, 2026
 
 On September 12, 2026, the user requested five specs and exactly one A/B pair:
 five samples with MCP off, then the same five with MCP on. This is a separate
@@ -97,13 +216,13 @@ repairs. An early stop is not a completed four-candidate search.
 | `7185ad2672` | 2 | 0 | 1 / 0 |
 | `d50f2ab6f0` | 0 | Stopped after attempt 1 | 4 / 7 |
 
-**Classification limitation.** B's shift spec did not encounter an API timeout,
+**Historical classification limitation.** B's shift spec did not encounter an API timeout,
 MCP failure, or missing pack. Its second candidate declares `ShiftOperation` and
 uses `getAQlClass()` / `getAPrimaryQlClass()` in the class characteristic predicate
 (`runs/E3-5spec-B-rep1-20260912/d50f2ab6f0/attempt_1/query.qll`, lines 10-15).
 CodeQL rejected this with nine non-monotonic-recursion diagnostics: two located
 in the generated file and seven in the standard library, in the same dependency
-cycle. `classify_compile` conservatively treats any error location outside the
+cycle. The frozen `classify_compile` conservatively treated any error location outside the
 generated pair as infrastructure failure, so it stopped after two candidates
 with two repairs unused. An offline, in-memory check reproduced that decision;
 retaining only the two local diagnostics changed the verdict to `query_error`.
@@ -116,8 +235,8 @@ The 4/5 result describes the executed harness, not exhaustion of B's full repair
 budget, and cannot establish what would have happened after fixing classification.
 The 0.25 repair mean uses only B's four successes, excluding this stopped sample;
 it should not be treated as an unconditional advantage over A's five successes.
-The classifier was deliberately not changed after the experiment began. A later
-fix needs a focused mixed-location recursion regression test and a separately
+The classifier was deliberately not changed after the experiment began. The E3-r2
+fix has focused mixed-location recursion regression tests; future A/B needs a separately
 declared experiment, not retroactive replacement of this observation.
 
 B produced more first-candidate successes, but not all involved model-selected
@@ -221,7 +340,7 @@ These declarations do not certify a held-out dataset or a stable improvement.
 Preserve every attempted repetition, including failures; the reporter cannot
 discover batches the operator omits.
 
-### Formal Run Procedure
+### Historical Formal Run Procedure
 
 The six `E3-A-rep1..3` / `E3-B-rep1..3` batches below have now been completed.
 Their results are in `runs/E3-formal-report/`; the commands document the procedure
@@ -384,9 +503,10 @@ controls and saved CLI evidence for all 18 compiled candidates, and all 17
 entries in `e3-freeze.sha256` matched after the experiment. Only documentation
 was updated after reporting; the freeze archive and original runs are unchanged.
 
-## Run E2
+## Experimental MCP-On Use
 
-In the fish terminal with `QL_API_KEY` and `QL_BASE_URL` exported:
+Use this retained path only for a deliberately scoped MCP experiment, not routine
+generation. In the fish terminal with `QL_API_KEY` and `QL_BASE_URL` exported:
 
 ```fish
 cd ~/qlcoder-cpp-lite
@@ -395,9 +515,9 @@ source env.sh
 ```
 
 This is a paid model run, not the small E0 probe. The output directory must be
-new. `--mcp on` is now supported and is the default. To run the CLI-only baseline
-under the same E2 code revision, use `--mcp off` and another output directory.
-Both modes share the unchanged `prompt.md`, model, config and four-candidate
+new. `--mcp on` remains the parser default, but is not the recommended usage mode.
+For the current CLI-only baseline, explicitly use `--mcp off` and a new directory.
+Both modes share the same `prompt.md`, model, config and four-candidate
 budget. `--samples samples.txt` uses the same serial workflow. No reinstall or
 new config fields are needed for the E0 deployment on this host.
 
@@ -407,10 +527,11 @@ new config fields are needed for the E0 deployment on this host.
   MCP/LSP. After a candidate is submitted, close the old session and open a new
   session for that candidate's complete `.ql` and `.qll` files. Each candidate
   remains unchanged. Format failures reuse the current read-only context.
-- The model may call `codeql_hover`, `codeql_definition`, and `codeql_complete`.
+- The model may call `codeql_hover`, `codeql_definition`, `codeql_complete`, and
+  (since E3-r2) position-independent `codeql_search_api` as described above.
   Wrapper arguments are `file` (`query.ql` or `query.qll`), `line`, and `character`.
   The harness resolves the file URI and checks 0-based/UTF-16 source positions.
-  Completion has a fixed 20-item limit with no model-controlled pagination.
+  Completion uses a fixed 20-item page; E3-r2 adds optional `query` and `offset`.
   Definition may include up to five bounded excerpts from the current pair or
   the pinned `codeql/cpp-all/7.0.0` cache, never arbitrary files or other versions.
 - Workspace/open/diagnostics operations belong to the harness, not the model.
@@ -506,15 +627,17 @@ with new Responses results.
 
 Protocol reference: <https://api-docs.deepseek.com/zh-cn/guides/responses_api>.
 
-## CLI-Only Baseline
+## Recommended CLI-Only Baseline
 
-First run the Responses probe described below once. Then, in the same fish
-terminal where `QL_API_KEY` and `QL_BASE_URL` were exported:
+Use the current enhanced harness, not the old `agents/querier.py`. If the API
+configuration is unchanged and a compatible probe has already passed, no repeat
+probe is needed. For a new setup or API change, use the separately scoped
+Responses probe below. In the fish terminal with the API variables exported:
 
 ```fish
 cd ~/qlcoder-cpp-lite
 source env.sh
-.venv/bin/python run.py --spec specs/12051b318b_spec.md --mcp off --out runs/e1-responses-debug-1
+.venv/bin/python run.py --spec specs/12051b318b_spec.md --mcp off --out runs/baseline-off-single-20260920
 ```
 
 The output directory must not exist yet; existing results are never overwritten.
@@ -523,24 +646,25 @@ This command uses the configured real model and can incur API charges. Each
 sample allows attempt 0 plus at most three repairs, including malformed JSON.
 Only connection failures get one transport retry; timeouts and HTTP errors
 (including authentication errors) stop that sample. SDK retries are disabled.
-Thus E1 makes at most eight API attempts per sample with the default budget,
+Thus off mode makes at most eight API attempts per sample with the default budget,
 and at most four candidate compiles, plus one template compile per batch.
 
-For the three debugging inputs, using a different, new output directory:
+For the five retained inputs, using a different, new output directory:
 
 ```fish
-.venv/bin/python run.py --samples samples.txt --mcp off --out runs/e1-responses-debug-batch-1
+.venv/bin/python run.py --samples samples-5.txt --mcp off --out runs/baseline-off-batch-20260920
 ```
 
-The current samples are unchanged copies of `12051b318b`, `02828845dd`, and
-`9c14791748` from the old project's specs. They cover const writes, inline-asm
-null-check elimination, and shared reads. They originated as debugging inputs;
-the E3 freeze reuses all three with explicit debug/evaluation overlap disclosure.
-No import, runtime path, or query from the old project is needed to run E1.
+`samples-5.txt` adds `7185ad2672` (memory clearing) and `d50f2ab6f0` (shifts) to
+the original const-write, inline-assembly and shared-read specs. `samples.txt`
+retains the original three-spec historical set. All five have now appeared in
+earlier runs and are not held-out. No import, runtime path or query from the old
+project is needed for this baseline.
 
-Pass `--mcp off` to retain the E1 CLI-only workflow. Default `on` now enables E2;
-it never silently becomes group A. E3 now supports `--smoke`, using the preserved
-E0 databases; see the E3 section above.
+Pass `--mcp off` explicitly; omitting it still enables MCP and is not a baseline
+run. The baseline includes later shared fixes, including E3-r2 CLI error
+classification, rather than reverting to the old E1 code. E3 supports `--smoke`,
+using the preserved E0 databases; see the E3 section above.
 There are no new Python dependencies, model overrides, resume/skip modes, or
 automatic dependency installs.
 
@@ -767,7 +891,7 @@ For the MCP regression tests:
 ```bash
 cd "$HOME/codeql-lsp-mcp"
 npm run build
-node --test --test-reporter=tap tests/diagnostics.test.mjs
+node --test --test-isolation=none --test-reporter=tap tests/*.test.mjs
 ```
 
 ## Recreate Dependencies
